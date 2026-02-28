@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conversation Topics</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    :root { --pico-font-size: 16px; }
+    body { padding: 2rem; }
+
+    /* Root categories */
+    details.root {
+      margin-bottom: 0.5rem;
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: 8px;
+    }
+    details.root > summary {
+      padding: 1rem 1.2rem;
+      font-size: 1.15rem;
+      font-weight: 700;
+      cursor: pointer;
+      list-style: none;
+    }
+    details.root > summary::before {
+      content: "\25B6\FE0E ";
+      font-size: 0.8em;
+      margin-right: 0.4rem;
+    }
+    details.root[open] > summary::before {
+      content: "\25BC\FE0E ";
+    }
+
+    /* Subcategories */
+    details.sub {
+      margin: 0.2rem 0 0.2rem 1.5rem;
+    }
+    details.sub > summary {
+      padding: 0.5rem 0.8rem;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+    }
+    details.sub > summary::before {
+      content: "\25B8\FE0E ";
+      font-size: 0.8em;
+      margin-right: 0.3rem;
+    }
+    details.sub[open] > summary::before {
+      content: "\25BE\FE0E ";
+    }
+
+    /* Topic leaves */
+    .topic-leaf {
+      display: block;
+      margin: 0.3rem 0 0.3rem 3rem;
+      padding: 0.6rem 1rem;
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: 6px;
+      text-decoration: none;
+      color: inherit;
+      transition: box-shadow 0.15s;
+    }
+    .topic-leaf:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+    .topic-leaf .leaf-title { font-weight: 500; }
+
+    .badge {
+      font-size: 0.8rem;
+      color: var(--pico-muted-color);
+      margin-left: 0.5rem;
+    }
+    .keyword-tag {
+      display: inline-block;
+      background: var(--pico-secondary-background);
+      padding: 0.1rem 0.45rem;
+      border-radius: 4px;
+      margin: 0.1rem 0.1rem;
+      font-size: 0.75rem;
+    }
+    .keywords { margin-top: 0.3rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Conversation Topics</h1>
+    <p>{{ total_topics }} topics across {{ tree | length }} categories.</p>
+  </header>
+  <main>
+    {% for root in tree %}
+    <details class="root"{{ " open" if loop.first }}>
+      <summary>
+        {{ root.name }}
+        <span class="badge">{{ root.segment_count }} segment{{ "s" if root.segment_count != 1 }}</span>
+      </summary>
+      {% for sub in root.subcategories %}
+      <details class="sub">
+        <summary>
+          {{ sub.name }}
+          <span class="badge">{{ sub.segment_count }} segment{{ "s" if sub.segment_count != 1 }}</span>
+        </summary>
+        {% for t in sub.topics %}
+        <a class="topic-leaf" href="/topic/{{ t.label | urlencode }}">
+          <span class="leaf-title">{{ t.label }}</span>
+          <span class="badge">{{ t.segment_count }} seg{{ "s" if t.segment_count != 1 }}</span>
+          {% if t.keywords %}
+          <div class="keywords">
+            {% for kw in t.keywords %}
+            <span class="keyword-tag">{{ kw }}</span>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </a>
+        {% endfor %}
+      </details>
+      {% endfor %}
+    </details>
+    {% endfor %}
+  </main>
+</body>
+</html>

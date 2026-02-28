@@ -6,21 +6,20 @@ structured notes in Notion using the notion-create-pages tool.
 """
 
 import json
-from typing import Any, Optional
+from typing import Any
 
 from mistralai import Mistral
 
-from config import MISTRAL_API_KEY, MISTRAL_MODEL
-from notion_mcp_client import call_notion_tool
-from oauth_handler import TokenSet, ensure_valid_tokens
-
+from .config import MISTRAL_API_KEY, MISTRAL_MODEL
+from .notion_mcp_client import call_notion_tool
+from .oauth_handler import TokenSet, ensure_valid_tokens
 
 # ---------------------------------------------------------------------------
 # Mistral summarizer
 # ---------------------------------------------------------------------------
 
 
-def summarize_subtopic(subtopic_label: str, segments: list[dict]) -> str:
+def summarize_subtopic(subtopic_label: str, segments: list[dict[str, Any]]) -> str:
     """Use Mistral to generate a 2-3 sentence summary of the subtopic content."""
     if not MISTRAL_API_KEY:
         return f"Notes on: {subtopic_label}"
@@ -51,7 +50,8 @@ def summarize_subtopic(subtopic_label: str, segments: list[dict]) -> str:
             },
         ],
     )
-    return response.choices[0].message.content
+    content = response.choices[0].message.content
+    return content if isinstance(content, str) else f"Notes on: {subtopic_label}"
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +59,7 @@ def summarize_subtopic(subtopic_label: str, segments: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_subtopic_markdown(subtopic_label: str, summary: str, segments: list[dict]) -> str:
+def _build_subtopic_markdown(subtopic_label: str, summary: str, segments: list[dict[str, Any]]) -> str:
     """Build markdown content for a subtopic page."""
     lines = []
     lines.append(f"## {subtopic_label}\n")
@@ -98,16 +98,16 @@ def _extract_page_id(mcp_result: Any) -> str:
                     if isinstance(data, dict) and "pages" in data:
                         pages = data["pages"]
                         if pages and isinstance(pages, list):
-                            return pages[0]["id"]
+                            return str(pages[0]["id"])
                     # Bare list fallback
                     if isinstance(data, list) and data:
-                        return data[0].get("id", str(data[0]))
+                        return str(data[0].get("id", str(data[0])))
                     if isinstance(data, dict) and "id" in data:
-                        return data["id"]
+                        return str(data["id"])
                 except (json.JSONDecodeError, TypeError, KeyError):
                     pass
                 # Plain UUID string
-                text = block.text.strip()
+                text = str(block.text).strip()
                 if len(text) == 36 and text.count("-") == 4:
                     return text
 
@@ -143,11 +143,11 @@ def _create_page(parent_page_id: str, title: str, content: str, tokens: TokenSet
 
 
 def create_topic_notes(
-    topic_hierarchy: list[dict],
+    topic_hierarchy: list[dict[str, Any]],
     parent_page_id: str,
-    tokens: Optional[TokenSet] = None,
+    tokens: TokenSet | None = None,
     dry_run: bool = False,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Create Notion pages for the entire topic hierarchy.
 
@@ -160,7 +160,7 @@ def create_topic_notes(
     Returns:
         List of results: [{ topic, subtopic, status, page_id_or_error }]
     """
-    if not tokens and not dry_run:
+    if not dry_run and tokens is None:
         tokens = ensure_valid_tokens()
 
     results = []
@@ -173,6 +173,7 @@ def create_topic_notes(
             topic_page_id = f"dry-run-{topic['cluster_id']}"
             print(f"  [DRY RUN] Would create page under {parent_page_id}")
         else:
+            assert tokens is not None
             topic_page_id = _create_page(
                 parent_page_id=parent_page_id,
                 title=topic_label,
@@ -195,13 +196,16 @@ def create_topic_notes(
             if dry_run:
                 print(f"    [DRY RUN] Would create page under {topic_page_id}")
                 print(f"    Content preview:\n{content[:200]}...\n")
-                results.append({
-                    "topic": topic_label,
-                    "subtopic": subtopic_label,
-                    "status": "dry_run",
-                    "content_length": len(content),
-                })
+                results.append(
+                    {
+                        "topic": topic_label,
+                        "subtopic": subtopic_label,
+                        "status": "dry_run",
+                        "content_length": len(content),
+                    }
+                )
             else:
+                assert tokens is not None
                 try:
                     sub_page_id = _create_page(
                         parent_page_id=topic_page_id,
@@ -210,20 +214,24 @@ def create_topic_notes(
                         tokens=tokens,
                     )
                     print(f"    ✅ Created: {sub_page_id}")
-                    results.append({
-                        "topic": topic_label,
-                        "subtopic": subtopic_label,
-                        "status": "created",
-                        "page_id": sub_page_id,
-                    })
+                    results.append(
+                        {
+                            "topic": topic_label,
+                            "subtopic": subtopic_label,
+                            "status": "created",
+                            "page_id": sub_page_id,
+                        }
+                    )
                 except Exception as e:
                     print(f"    ❌ Failed: {e}")
-                    results.append({
-                        "topic": topic_label,
-                        "subtopic": subtopic_label,
-                        "status": "error",
-                        "error": str(e),
-                    })
+                    results.append(
+                        {
+                            "topic": topic_label,
+                            "subtopic": subtopic_label,
+                            "status": "error",
+                            "error": str(e),
+                        }
+                    )
 
     return results
 
@@ -234,7 +242,8 @@ def create_topic_notes(
 
 if __name__ == "__main__":
     import os
-    from sample_data import SAMPLE_TOPIC_HIERARCHY
+
+    from .sample_data import SAMPLE_TOPIC_HIERARCHY
 
     parent_id = os.environ.get("NOTION_PARENT_PAGE_ID")
 

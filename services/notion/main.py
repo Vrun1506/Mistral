@@ -15,19 +15,16 @@ Usage:
 
 import argparse
 import json
-import sys
 
-from oauth_handler import ensure_valid_tokens
-from notion_mcp_client import list_notion_tools
-from note_creator import create_topic_notes
-from page_resolver import resolve_parent_page
-from sample_data import SAMPLE_TOPIC_HIERARCHY
+from .note_creator import create_topic_notes
+from .notion_mcp_client import list_notion_tools
+from .oauth_handler import ensure_valid_tokens
+from .page_resolver import resolve_parent_page
+from .sample_data import SAMPLE_TOPIC_HIERARCHY
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Notion MCP PoC — Create study notes from pipeline output"
-    )
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Notion MCP PoC — Create study notes from pipeline output")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -89,10 +86,7 @@ def main():
     for topic in hierarchy:
         subtopic_count = len(topic["subtopics"])
         segment_count = sum(len(st["segments"]) for st in topic["subtopics"])
-        print(
-            f"  📁 {topic['topic_label']} "
-            f"({subtopic_count} subtopics, {segment_count} segments)"
-        )
+        print(f"  📁 {topic['topic_label']} ({subtopic_count} subtopics, {segment_count} segments)")
         for st in topic["subtopics"]:
             print(f"    📄 {st['subtopic_label']} ({len(st['segments'])} segments)")
     print()
@@ -107,6 +101,7 @@ def main():
         print("Dry run — skipping page selection\n")
     else:
         # Interactive search-and-select via MCP (no env var needed)
+        assert tokens is not None
         parent_page_id = resolve_parent_page(tokens)
         print(f"\nUsing parent page: {parent_page_id}\n")
 

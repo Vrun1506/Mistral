@@ -10,16 +10,15 @@ This replaces the need for a NOTION_PARENT_PAGE_ID environment variable.
 """
 
 import json
-from typing import Optional
+from typing import Any
 
-from oauth_handler import TokenSet
-from notion_mcp_client import (
+from .notion_mcp_client import (
     call_tool,
-    list_tools,
-    extract_text_from_result,
     extract_json_from_result,
+    extract_text_from_result,
+    list_tools,
 )
-
+from .oauth_handler import TokenSet
 
 # ---------------------------------------------------------------------------
 # Tool name discovery
@@ -34,7 +33,7 @@ def discover_tool_names(tokens: TokenSet) -> dict[str, str]:
     Query the MCP server for available tools and map them to our needs.
     Returns {"search": "actual_name", "create_page": "actual_name"}.
     """
-    tools = list_tools(tokens)
+    tools: list[dict[str, Any]] = list_tools(tokens)
     tool_names = [t["name"] for t in tools]
 
     print(f"\n  Available MCP tools: {tool_names}\n")
@@ -73,14 +72,10 @@ def discover_tool_names(tokens: TokenSet) -> dict[str, str]:
                 break
 
     if "search" not in mapping:
-        raise RuntimeError(
-            "Could not find a search tool on the Notion MCP server.\n"
-            f"  Available tools: {tool_names}"
-        )
+        raise RuntimeError(f"Could not find a search tool on the Notion MCP server.\n  Available tools: {tool_names}")
     if "create_page" not in mapping:
         raise RuntimeError(
-            "Could not find a create-page tool on the Notion MCP server.\n"
-            f"  Available tools: {tool_names}"
+            f"Could not find a create-page tool on the Notion MCP server.\n  Available tools: {tool_names}"
         )
 
     print(f"  Mapped -> search='{mapping['search']}', create_page='{mapping['create_page']}'\n")
@@ -92,7 +87,7 @@ def discover_tool_names(tokens: TokenSet) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def search_workspace(query: str, tokens: TokenSet, tool_name: str = SEARCH_TOOL) -> list[dict]:
+def search_workspace(query: str, tokens: TokenSet, tool_name: str = SEARCH_TOOL) -> list[dict[str, str]]:
     """
     Search the user's Notion workspace via MCP.
     Returns a list of pages: [{"id": "...", "title": "..."}, ...]
@@ -105,12 +100,16 @@ def search_workspace(query: str, tokens: TokenSet, tool_name: str = SEARCH_TOOL)
         data = json.loads(text)
         if isinstance(data, list):
             for item in data:
-                pages.append({
-                    "id": item.get("id", item.get("page_id", "")),
-                    "title": item.get("title", item.get("name", "Untitled")),
-                })
+                pages.append(
+                    {
+                        "id": item.get("id", item.get("page_id", "")),
+                        "title": item.get("title", item.get("name", "Untitled")),
+                    }
+                )
         elif isinstance(data, dict):
             results = data.get("results", data.get("pages", [data]))
+            if not isinstance(results, list):
+                results = [results]
             for item in results:
                 title = "Untitled"
                 props = item.get("properties", {})
@@ -141,9 +140,7 @@ def create_new_page(title: str, tokens: TokenSet, tool_name: str = CREATE_PAGE_T
         {
             "pages": [
                 {
-                    "properties": {
-                        "title": title
-                    },
+                    "properties": {"title": title},
                     "content": "Auto-created by Flashcard Pipeline",
                 }
             ]
@@ -158,9 +155,9 @@ def create_new_page(title: str, tokens: TokenSet, tool_name: str = CREATE_PAGE_T
     if data:
         # Response might be a list of created pages or a single dict
         if isinstance(data, list) and data:
-            return data[0].get("id", data[0].get("page_id", str(data[0])))
+            return str(data[0].get("id", data[0].get("page_id", str(data[0]))))
         if isinstance(data, dict):
-            return data.get("id", data.get("page_id", str(data)))
+            return str(data.get("id", data.get("page_id", str(data))))
 
     # Fallback: return the raw text (may be a page URL or ID)
     return text.strip()
@@ -189,8 +186,8 @@ def resolve_parent_page(tokens: TokenSet) -> str:
         print(f"\n  Found {len(pages)} pages:\n")
         for i, page in enumerate(pages, 1):
             print(f"    [{i}] {page['title'] or 'Untitled'}")
-        print(f"    [0] Create a new page")
-        print(f"    [m] Enter a page ID manually")
+        print("    [0] Create a new page")
+        print("    [m] Enter a page ID manually")
         print()
 
         choice = input("  Select (number): ").strip().lower()
@@ -207,7 +204,7 @@ def resolve_parent_page(tokens: TokenSet) -> str:
             if 0 <= idx < len(pages):
                 selected = pages[idx]
                 print(f"  Selected: {selected['title']} ({selected['id']})")
-                return selected["id"]
+                return str(selected["id"])
             else:
                 print("  Invalid selection. Creating new page.")
                 page_id = create_new_page("📚 Study Notes", tokens, tool_name=create_name)
@@ -231,7 +228,7 @@ def resolve_parent_page(tokens: TokenSet) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from oauth_handler import ensure_valid_tokens
+    from .oauth_handler import ensure_valid_tokens
 
     tokens = ensure_valid_tokens()
     page_id = resolve_parent_page(tokens)

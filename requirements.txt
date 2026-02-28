@@ -1,7 +1,18 @@
 fastapi
 uvicorn[standard]
 pydantic
+jinja2
 requests>=2.31.0
 mistralai>=1.0.0
 mcp>=1.0.0
 authlib>=1.3.0
+
+# Pipeline dependencies
+openai
+numpy
+scikit-learn
+bertopic
+umap-learn
+hdbscan
+curl_cffi
+python-dotenv

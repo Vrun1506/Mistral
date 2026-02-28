@@ -23,17 +23,19 @@ import time
 import webbrowser
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests as http_requests
 
-from config import (
+from .config import (
     CLIENT_FILE,
     MCP_SERVER_URL,
-    OAUTH_CALLBACK_PORT as CALLBACK_PORT,
     REDIRECT_URI,
     TOKEN_FILE,
+)
+from .config import (
+    OAUTH_CALLBACK_PORT as CALLBACK_PORT,
 )
 
 # ---------------------------------------------------------------------------
@@ -46,21 +48,21 @@ class OAuthMetadata:
     issuer: str
     authorization_endpoint: str
     token_endpoint: str
-    registration_endpoint: Optional[str] = None
+    registration_endpoint: str | None = None
     code_challenge_methods_supported: list[str] = field(default_factory=list)
 
 
 @dataclass
 class ClientCredentials:
     client_id: str
-    client_secret: Optional[str] = None
+    client_secret: str | None = None
 
 
 @dataclass
 class TokenSet:
     access_token: str
-    refresh_token: Optional[str] = None
-    expires_in: Optional[int] = None
+    refresh_token: str | None = None
+    expires_in: int | None = None
     token_type: str = "Bearer"
     obtained_at: float = 0.0
 
@@ -171,11 +173,11 @@ def register_client(
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
-    authorization_code: Optional[str] = None
-    received_state: Optional[str] = None
-    error: Optional[str] = None
+    authorization_code: str | None = None
+    received_state: str | None = None
+    error: str | None = None
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         params = parse_qs(urlparse(self.path).query)
         if "error" in params:
             _CallbackHandler.error = params["error"][0]
@@ -192,7 +194,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body.encode())
 
-    def log_message(self, *args):
+    def log_message(self, format: str, *args: Any) -> None:
         pass
 
 
@@ -304,17 +306,17 @@ def refresh_access_token(
 # ---------------------------------------------------------------------------
 
 
-def _save_tokens(tokens: TokenSet):
+def _save_tokens(tokens: TokenSet) -> None:
     TOKEN_FILE.write_text(json.dumps(asdict(tokens), indent=2))
 
 
-def load_tokens() -> Optional[TokenSet]:
+def load_tokens() -> TokenSet | None:
     if not TOKEN_FILE.exists():
         return None
     return TokenSet(**json.loads(TOKEN_FILE.read_text()))
 
 
-def load_client() -> Optional[ClientCredentials]:
+def load_client() -> ClientCredentials | None:
     if not CLIENT_FILE.exists():
         return None
     return ClientCredentials(**json.loads(CLIENT_FILE.read_text()))
@@ -340,15 +342,17 @@ def run_oauth_flow() -> TokenSet:
     state = generate_state()
 
     print("[4/5] Opening browser ...")
-    auth_params = urlencode({
-        "response_type": "code",
-        "client_id": client.client_id,
-        "redirect_uri": REDIRECT_URI,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-        "state": state,
-        "prompt": "consent",
-    })
+    auth_params = urlencode(
+        {
+            "response_type": "code",
+            "client_id": client.client_id,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            "prompt": "consent",
+        }
+    )
     auth_url = f"{metadata.authorization_endpoint}?{auth_params}"
     webbrowser.open(auth_url)
 
@@ -392,7 +396,10 @@ if __name__ == "__main__":
         if t and t.refresh_token:
             m = discover_oauth_metadata()
             c = load_client()
-            refresh_access_token(t, m, c)
+            if c:
+                refresh_access_token(t, m, c)
+            else:
+                run_oauth_flow()
         else:
             run_oauth_flow()
     else:

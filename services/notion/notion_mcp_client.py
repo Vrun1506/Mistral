@@ -12,17 +12,17 @@ Uses the official MCP Python SDK with Streamable HTTP transport (fallback to SSE
 
 import asyncio
 import json
-from typing import Any, Optional
+from typing import Any
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
-from config import MCP_SERVER_URL
-from oauth_handler import (
+from .config import MCP_SERVER_URL
+from .oauth_handler import (
     TokenSet,
-    ensure_valid_tokens,
     discover_oauth_metadata,
+    ensure_valid_tokens,
     load_client,
     refresh_access_token,
 )
@@ -37,7 +37,7 @@ class NotionMCPClient:
       - Tool listing and invocation
     """
 
-    def __init__(self, tokens: Optional[TokenSet] = None):
+    def __init__(self, tokens: TokenSet | None = None):
         self.tokens = tokens or ensure_valid_tokens()
         self.server_url = MCP_SERVER_URL
 
@@ -47,7 +47,7 @@ class NotionMCPClient:
             "User-Agent": "Flashcard-Pipeline-Notion-MCP/1.0",
         }
 
-    async def list_tools(self) -> list[dict]:
+    async def list_tools(self) -> list[dict[str, Any]]:
         """Return all tools exposed by the Notion MCP server."""
         try:
             return await self._list_tools_streamable_http()
@@ -55,7 +55,7 @@ class NotionMCPClient:
             print(f"[mcp] Streamable HTTP failed ({e}), falling back to SSE ...")
             return await self._list_tools_sse()
 
-    async def _list_tools_streamable_http(self) -> list[dict]:
+    async def _list_tools_streamable_http(self) -> list[dict[str, Any]]:
         url = f"{self.server_url}/mcp"
         async with streamablehttp_client(url, headers=self._auth_headers()) as (read, write, _):
             async with ClientSession(read, write) as session:
@@ -70,7 +70,7 @@ class NotionMCPClient:
                     for tool in result.tools
                 ]
 
-    async def _list_tools_sse(self) -> list[dict]:
+    async def _list_tools_sse(self) -> list[dict[str, Any]]:
         url = f"{self.server_url}/sse"
         async with sse_client(url, headers=self._auth_headers()) as (read, write):
             async with ClientSession(read, write) as session:
@@ -110,10 +110,12 @@ class NotionMCPClient:
                 await session.initialize()
                 return await session.call_tool(tool_name, arguments)
 
-    async def refresh_and_reconnect(self):
+    async def refresh_and_reconnect(self) -> None:
         """Refresh OAuth tokens."""
         metadata = discover_oauth_metadata()
         client = load_client()
+        if not client:
+            raise RuntimeError("No client credentials — re-authentication required")
         self.tokens = refresh_access_token(self.tokens, metadata, client)
 
 
@@ -127,15 +129,18 @@ def extract_text_from_result(result: Any) -> str:
     if hasattr(result, "content"):
         for block in result.content:
             if hasattr(block, "text"):
-                return block.text
+                return str(block.text)
     return str(result)
 
 
-def extract_json_from_result(result: Any) -> Optional[dict]:
+def extract_json_from_result(result: Any) -> dict[str, Any] | None:
     """Try to parse JSON from an MCP tool call result. Returns None on failure."""
     text = extract_text_from_result(result)
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+        return None
     except (json.JSONDecodeError, TypeError):
         return None
 
@@ -145,10 +150,10 @@ def extract_json_from_result(result: Any) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
-def list_notion_tools(tokens: Optional[TokenSet] = None) -> list[dict]:
+def list_notion_tools(tokens: TokenSet | None = None) -> list[dict[str, Any]]:
     """Synchronous wrapper to list all available Notion MCP tools."""
 
-    async def _run():
+    async def _run() -> list[dict[str, Any]]:
         client = NotionMCPClient(tokens)
         return await client.list_tools()
 
@@ -162,11 +167,11 @@ list_tools = list_notion_tools
 def call_notion_tool(
     tool_name: str,
     arguments: dict[str, Any],
-    tokens: Optional[TokenSet] = None,
+    tokens: TokenSet | None = None,
 ) -> Any:
     """Synchronous wrapper to call a single Notion MCP tool."""
 
-    async def _run():
+    async def _run() -> Any:
         client = NotionMCPClient(tokens)
         return await client.call_tool(tool_name, arguments)
 

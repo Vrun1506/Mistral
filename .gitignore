@@ -7,3 +7,13 @@ __pycache__/
 dist/
 build/
 .ruff_cache/
+
+# Credentials
+cookies.json
+services/notion/tokens.json
+services/notion/client.json
+
+# Generated pipeline data
+conversations.json
+topic_groups.json
+topic_hierarchy.json
