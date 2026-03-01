@@ -612,26 +612,18 @@ async def async_label_clusters(
     return result
 
 
-async def async_build_hierarchy(
+HIERARCHY_BATCH_SIZE = 30  # max topics per LLM call
+
+
+async def _hierarchy_call(
     client: AsyncOpenAI,
-    topic_groups: dict[str, Any],
+    entries_text: str,
+    n: int,
     on_progress: Callable[..., Any] | None = None,
+    progress_label: str = "",
 ) -> dict[str, Any]:
-    """Build 3-level topic hierarchy asynchronously via Mistral."""
+    """Single hierarchy LLM call with retry logic. Returns parsed JSON."""
     from models.schemas import PipelinePhase
-
-    if on_progress:
-        on_progress(PipelinePhase.hierarchy, "Building topic hierarchy...", 0.0)
-
-    entries = []
-    for label, info in topic_groups.items():
-        kws = info.get("keywords", [])[:6]
-        if kws:
-            entries.append(f'- "{label}" [keywords: {", ".join(kws)}]')
-        else:
-            entries.append(f'- "{label}"')
-    entries_text = "\n".join(entries)
-    n = len(entries)
 
     prompt = (
         "You are an expert librarian organizing technical topics into a knowledge taxonomy.\n\n"
@@ -649,25 +641,22 @@ async def async_build_hierarchy(
         "  }\n"
         "}\n\n"
         "Rules:\n"
-        "- Create as many root categories and subcategories as needed to organize the topics naturally\n"
+        "- Create as many root categories and subcategories as needed\n"
         "- Every topic label must appear EXACTLY once as a leaf\n"
-        "- Use the EXACT label text in quotes — do not rename or modify any label\n\n"
+        "- Use the EXACT label text — do not rename or modify any label\n\n"
         f"Topics:\n{entries_text}"
     )
 
-    max_tokens = max(2000, n * 50)
-
-    max_retries = 3
-    hierarchy: dict[str, Any] = {}
+    max_tokens = max(2000, n * 60)
     sys_msg = "You are an expert librarian and taxonomist. Respond with JSON only."
 
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, 4):
         if on_progress:
             if attempt == 1:
-                msg = f"Organizing {n} topics into hierarchy..."
+                msg = f"Organizing {progress_label or f'{n} topics'}..."
             else:
-                msg = f"Retrying hierarchy (attempt {attempt}/{max_retries})..."
-            on_progress(PipelinePhase.hierarchy, msg, 0.1 * attempt)
+                msg = f"Retrying {progress_label or 'hierarchy'} (attempt {attempt}/3)..."
+            on_progress(PipelinePhase.hierarchy, msg, 0.0)
 
         try:
             resp = await asyncio.wait_for(
@@ -683,26 +672,142 @@ async def async_build_hierarchy(
                 timeout=120,
             )
         except TimeoutError:
-            print(f"  Hierarchy attempt {attempt} timed out after 120s")
-            if attempt == max_retries:
+            print(f"  Hierarchy {progress_label} attempt {attempt} timed out")
+            if on_progress:
+                on_progress(
+                    PipelinePhase.hierarchy,
+                    f"Timeout on attempt {attempt}/3, retrying...",
+                    0.0,
+                )
+            if attempt == 3:
                 raise
             continue
 
         raw_content = resp.choices[0].message.content
         raw = raw_content.strip() if raw_content else ""
-
         raw = _re.sub(r"^```(?:json)?\s*", "", raw)
         raw = _re.sub(r"\s*```$", "", raw)
 
+        # Check for finish_reason indicating truncation
+        finish = resp.choices[0].finish_reason
+        if finish == "length":
+            print(f"  Hierarchy {progress_label} attempt {attempt}: output truncated (max_tokens={max_tokens})")
+            if on_progress:
+                on_progress(
+                    PipelinePhase.hierarchy,
+                    f"Response truncated on attempt {attempt}/3, retrying...",
+                    0.0,
+                )
+            if attempt == 3:
+                # Try to salvage truncated JSON
+                break
+            max_tokens = int(max_tokens * 1.5)
+            continue
+
         try:
-            hierarchy = json.loads(raw)
-            break
+            return json.loads(raw)
         except json.JSONDecodeError as exc:
-            print(f"  Hierarchy attempt {attempt} returned invalid JSON: {exc}")
-            print(f"  Raw response (first 500 chars): {raw[:500]}")
-            if attempt == max_retries:
+            print(f"  Hierarchy {progress_label} attempt {attempt} invalid JSON: {exc}")
+            print(f"  Raw (first 500): {raw[:500]}")
+            if on_progress:
+                on_progress(
+                    PipelinePhase.hierarchy,
+                    f"Invalid JSON on attempt {attempt}/3, retrying...",
+                    0.0,
+                )
+            if attempt == 3:
                 raise
             continue
+
+    # Should not reach here normally, but handle truncated last attempt
+    raise ValueError(f"Hierarchy failed after 3 attempts for {progress_label}")
+
+
+async def async_build_hierarchy(
+    client: AsyncOpenAI,
+    topic_groups: dict[str, Any],
+    on_progress: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Build 3-level topic hierarchy asynchronously via Mistral.
+
+    For large topic sets (>HIERARCHY_BATCH_SIZE), splits into batches,
+    builds sub-hierarchies concurrently, then merges.
+    """
+    from models.schemas import PipelinePhase
+
+    if on_progress:
+        on_progress(PipelinePhase.hierarchy, "Building topic hierarchy...", 0.0)
+
+    # Build entries list
+    all_labels = list(topic_groups.keys())
+    n = len(all_labels)
+
+    def _make_entries(labels: list[str]) -> str:
+        entries = []
+        for label in labels:
+            info = topic_groups.get(label, {})
+            kws = info.get("keywords", [])[:6]
+            if kws:
+                entries.append(f'- "{label}" [keywords: {", ".join(kws)}]')
+            else:
+                entries.append(f'- "{label}"')
+        return "\n".join(entries)
+
+    hierarchy: dict[str, Any]
+
+    if n <= HIERARCHY_BATCH_SIZE:
+        # Small enough for a single call
+        entries_text = _make_entries(all_labels)
+        hierarchy = await _hierarchy_call(
+            client,
+            entries_text,
+            n,
+            on_progress,
+            progress_label=f"{n} topics",
+        )
+    else:
+        # Split into batches and build concurrently
+        batches: list[list[str]] = []
+        for i in range(0, n, HIERARCHY_BATCH_SIZE):
+            batches.append(all_labels[i : i + HIERARCHY_BATCH_SIZE])
+
+        if on_progress:
+            on_progress(
+                PipelinePhase.hierarchy,
+                f"Splitting {n} topics into {len(batches)} batches...",
+                0.0,
+            )
+
+        async def _do_batch(idx: int, batch_labels: list[str]) -> dict[str, Any]:
+            entries_text = _make_entries(batch_labels)
+            return await _hierarchy_call(
+                client,
+                entries_text,
+                len(batch_labels),
+                on_progress,
+                progress_label=f"batch {idx + 1}/{len(batches)}",
+            )
+
+        results = await asyncio.gather(*[_do_batch(i, b) for i, b in enumerate(batches)])
+
+        # Merge sub-hierarchies
+        hierarchy = {}
+        for sub_h in results:
+            for root_name, subcats in sub_h.items():
+                if root_name not in hierarchy:
+                    hierarchy[root_name] = {}
+                for sub_name, labels in subcats.items():
+                    if isinstance(labels, str):
+                        labels = [labels]
+                    existing = hierarchy[root_name].get(sub_name, [])
+                    hierarchy[root_name][sub_name] = existing + labels
+
+        if on_progress:
+            on_progress(
+                PipelinePhase.hierarchy,
+                f"Merged {len(batches)} batches into hierarchy",
+                0.8,
+            )
 
     # Normalize 2-level → 3-level
     for root_name, value in list(hierarchy.items()):
@@ -724,11 +829,11 @@ async def async_build_hierarchy(
     extra = found - expected
 
     if missing:
-        print(f"  Warning: {len(missing)} labels missing from hierarchy: {missing}")
+        print(f"  Warning: {len(missing)} labels missing from hierarchy")
         last_root = list(hierarchy.keys())[-1]
         hierarchy[last_root].setdefault("Other", []).extend(sorted(missing))
     if extra:
-        print(f"  Warning: {len(extra)} extra labels in hierarchy — removing: {extra}")
+        print(f"  Warning: {len(extra)} extra labels — removing")
         for root_name, subcats in list(hierarchy.items()):
             for sub_name, labels in list(subcats.items()):
                 subcats[sub_name] = [lb for lb in labels if lb not in extra]
