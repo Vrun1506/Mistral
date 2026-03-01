@@ -656,22 +656,53 @@ async def async_build_hierarchy(
     )
 
     max_tokens = max(2000, n * 50)
-    resp = await client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": "You are an expert librarian and taxonomist. Respond with JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        max_tokens=max_tokens,
-        temperature=0.3,
-    )
-    raw_content = resp.choices[0].message.content
-    raw = raw_content.strip() if raw_content else ""
 
-    raw = _re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = _re.sub(r"\s*```$", "", raw)
+    max_retries = 3
+    hierarchy: dict[str, Any] = {}
+    sys_msg = "You are an expert librarian and taxonomist. Respond with JSON only."
 
-    hierarchy: dict[str, Any] = json.loads(raw)
+    for attempt in range(1, max_retries + 1):
+        if on_progress:
+            if attempt == 1:
+                msg = f"Organizing {n} topics into hierarchy..."
+            else:
+                msg = f"Retrying hierarchy (attempt {attempt}/{max_retries})..."
+            on_progress(PipelinePhase.hierarchy, msg, 0.1 * attempt)
+
+        try:
+            resp = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                ),
+                timeout=120,
+            )
+        except TimeoutError:
+            print(f"  Hierarchy attempt {attempt} timed out after 120s")
+            if attempt == max_retries:
+                raise
+            continue
+
+        raw_content = resp.choices[0].message.content
+        raw = raw_content.strip() if raw_content else ""
+
+        raw = _re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = _re.sub(r"\s*```$", "", raw)
+
+        try:
+            hierarchy = json.loads(raw)
+            break
+        except json.JSONDecodeError as exc:
+            print(f"  Hierarchy attempt {attempt} returned invalid JSON: {exc}")
+            print(f"  Raw response (first 500 chars): {raw[:500]}")
+            if attempt == max_retries:
+                raise
+            continue
 
     # Normalize 2-level → 3-level
     for root_name, value in list(hierarchy.items()):
