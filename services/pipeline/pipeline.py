@@ -682,6 +682,23 @@ async def _hierarchy_call(
             if attempt == 3:
                 raise
             continue
+        except Exception as exc:
+            # Catch 429 rate limits and other API errors
+            exc_str = str(exc)
+            print(f"  Hierarchy {progress_label} attempt {attempt} error: {exc_str}")
+            if "429" in exc_str:
+                wait = 5 * attempt
+                if on_progress:
+                    on_progress(
+                        PipelinePhase.hierarchy,
+                        f"Rate limited, waiting {wait}s (attempt {attempt}/3)...",
+                        0.0,
+                    )
+                await asyncio.sleep(wait)
+                if attempt == 3:
+                    raise
+                continue
+            raise
 
         raw_content = resp.choices[0].message.content
         raw = raw_content.strip() if raw_content else ""
@@ -788,7 +805,10 @@ async def async_build_hierarchy(
                 progress_label=f"batch {idx + 1}/{len(batches)}",
             )
 
-        results = await asyncio.gather(*[_do_batch(i, b) for i, b in enumerate(batches)])
+        # Run sequentially to avoid rate limits
+        results = []
+        for i, b in enumerate(batches):
+            results.append(await _do_batch(i, b))
 
         # Merge sub-hierarchies
         hierarchy = {}
