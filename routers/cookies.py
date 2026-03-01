@@ -38,6 +38,9 @@ async def get_cookies(request: Request, file: Annotated[UploadFile, File()]) -> 
         raise HTTPException(status_code=401, detail="Missing auth cookie")
 
     try:
+        import base64
+        if raw.startswith("base64-"):
+            raw = base64.b64decode(raw[len("base64-"):] + "==").decode()
         session = json.loads(raw)
         access_token: str = session["access_token"]
     except (json.JSONDecodeError, KeyError) as exc:
