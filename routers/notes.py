@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 
 from auth import get_current_user_id
-from services.pipeline.pipeline import CHAT_MODEL, get_async_client, get_llm_semaphore
+from services.pipeline.pipeline import CHAT_MODEL, _get_llm_sem, get_async_client
 from store import UserData, get_user
 
 router = APIRouter(prefix="/api", tags=["notes"])
@@ -69,7 +69,7 @@ async def _generate_note_for_topic(
     )
 
     client = get_async_client()
-    sem = get_llm_semaphore()
+    sem = _get_llm_sem()
 
     async with sem:
         for attempt in range(1, 4):
