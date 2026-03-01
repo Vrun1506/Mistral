@@ -129,6 +129,14 @@ def _is_sensitive(label: str, keywords: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+APP_VERSION = 1
+
+
+@app.get("/api/version")
+async def version() -> dict[str, int]:
+    return {"version": APP_VERSION}
+
+
 @app.get("/")
 async def index() -> RedirectResponse:
     return RedirectResponse(f"{FRONTEND_URL}/dashboard")
