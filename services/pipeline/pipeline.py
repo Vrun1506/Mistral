@@ -1,12 +1,12 @@
 """
 Segmentation + Clustering pipeline.
 
-1. Embed messages via NVIDIA NIM API (baai/bge-m3)
+1. Embed messages via NVIDIA NIM API (baai/bge-m3) — per-conversation file cache
 2. Segment conversations via DeepTiling (cosine similarity depth scores)
 3. Mean-pool segment embeddings
 4. BERTopic: UMAP → HDBSCAN → c-TF-IDF
-5. Label clusters via Mistral on NVIDIA NIM
-6. Build 3-level topic hierarchy via Mistral
+5. Label clusters via Mistral on NVIDIA NIM (concurrent, Semaphore(15), 429 retry)
+6. Build 3-level topic hierarchy via Mistral (overlapped with labeling via producer-consumer)
 """
 
 from __future__ import annotations
@@ -938,6 +938,7 @@ async def _hierarchy_consumer(
     hier_sem = asyncio.Semaphore(3)
 
     def _make_entries(labels: list[str]) -> str:
+        """Format labels + keywords into the bullet-list prompt format for _hierarchy_call."""
         entries = []
         for label in labels:
             info = accumulated.get(label, {})
@@ -949,6 +950,8 @@ async def _hierarchy_consumer(
         return "\n".join(entries)
 
     def _fire_batch(batch_labels: list[str], idx: int, n_batches_est: str) -> asyncio.Task[dict]:
+        """Create and return a task that runs a single hierarchy LLM call for a batch."""
+
         async def _run() -> dict:
             async with hier_sem:
                 entries_text = _make_entries(batch_labels)

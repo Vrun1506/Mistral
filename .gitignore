@@ -7,6 +7,8 @@ __pycache__/
 dist/
 build/
 .ruff_cache/
+.embed_cache/
+.mypy_cache/
 
 # Credentials
 cookies.json

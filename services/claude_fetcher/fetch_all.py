@@ -153,7 +153,8 @@ async def async_fetch_conversations(
     """Fetch all conversations asynchronously using curl_cffi AsyncSession.
 
     Parameters are passed directly — no cookies.json needed.
-    Uses Semaphore(8) for concurrent full-conversation fetches.
+    Uses prefetch: detail fetches are dispatched as each listing page arrives,
+    overlapping pagination with concurrent detail fetching (Semaphore(15)).
     """
     from models.schemas import PipelinePhase
 
