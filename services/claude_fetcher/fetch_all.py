@@ -190,7 +190,7 @@ async def async_fetch_conversations(
         total = len(convos)
 
         # 2. Fetch full conversations concurrently with semaphore
-        sem = asyncio.Semaphore(8)
+        sem = asyncio.Semaphore(15)
         results: list[dict[str, Any] | None] = [None] * total
 
         async def fetch_one(idx: int, conv: dict[str, Any]) -> None:
