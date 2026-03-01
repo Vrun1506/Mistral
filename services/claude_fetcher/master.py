@@ -48,17 +48,11 @@ class ProgressEvent(TypedDict, total=False):
 
 
 class ClaudeFetcher:
-    def __init__(self, cookies: list[CookieInput]) -> None:
-        cookie_jar = {c["name"]: c["value"] for c in cookies}
-
-        org_id = cookie_jar.get("lastActiveOrg")
-        if not org_id:
-            raise ValueError("lastActiveOrg not found in cookies")
-
-        headers = {**HEADERS, "anthropic-device-id": cookie_jar["anthropic-device-id"]}
+    def __init__(self, session_key: str, org_id: str) -> None:
+        cookie_jar = {"sessionKey": session_key, "lastActiveOrg": org_id}
 
         self.org_id = org_id
-        self.session = AsyncSession(headers=headers, cookies=cookie_jar, impersonate="chrome")
+        self.session = AsyncSession(headers=HEADERS, cookies=cookie_jar, impersonate="chrome")
 
     async def close(self) -> None:
         await self.session.close()

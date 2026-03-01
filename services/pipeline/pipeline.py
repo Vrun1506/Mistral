@@ -420,7 +420,7 @@ async def async_embed_texts(
     total = len(batches)
     results: list[list[list[float]]] = [[] for _ in range(total)]
 
-    sem = asyncio.Semaphore(3)
+    sem = asyncio.Semaphore(6)
 
     async def embed_batch(idx: int, batch: list[str]) -> None:
         async with sem:

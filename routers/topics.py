@@ -4,27 +4,33 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from auth import get_current_user_id
 from models.schemas import TopicDetail, TreeRoot, TreeSubcategory, TreeTopic
+from store import get_user
 
 router = APIRouter(prefix="/api", tags=["topics"])
 
 
 @router.get("/tree", response_model=list[TreeRoot])
-async def get_tree() -> list[TreeRoot]:
+async def get_tree(user_id: str = Depends(get_current_user_id)) -> list[TreeRoot]:
     """Return the full topic tree as JSON (sensitive topics excluded)."""
-    from main import HIERARCHY, TOPIC_GROUPS, _is_sensitive
+    from main import _is_sensitive
+
+    user = get_user(user_id)
+    if not user.topic_groups or not user.hierarchy:
+        return []
 
     tree: list[TreeRoot] = []
-    for root_name, subcats in HIERARCHY.items():
+    for root_name, subcats in user.hierarchy.items():
         root_seg = 0
         subs: list[TreeSubcategory] = []
         for sub_name, labels in subcats.items():
             topics: list[TreeTopic] = []
             sub_seg = 0
             for label in labels:
-                info: dict[str, Any] = TOPIC_GROUPS.get(label, {})
+                info: dict[str, Any] = user.topic_groups.get(label, {})
                 keywords = info.get("keywords", [])[:5]
                 if _is_sensitive(label, keywords):
                     continue
@@ -40,21 +46,24 @@ async def get_tree() -> list[TreeRoot]:
 
 
 @router.get("/topic/{label}", response_model=TopicDetail)
-async def get_topic(label: str) -> TopicDetail:
+async def get_topic(label: str, user_id: str = Depends(get_current_user_id)) -> TopicDetail:
     """Return topic detail as JSON (404 if not found or sensitive)."""
-    from main import HIERARCHY, TOPIC_GROUPS, _is_sensitive
+    from main import _is_sensitive
 
-    info = TOPIC_GROUPS.get(label)
+    user = get_user(user_id)
+    if not user.topic_groups or not user.hierarchy:
+        raise HTTPException(status_code=404, detail="No pipeline results yet")
+
+    info = user.topic_groups.get(label)
     if not info:
         raise HTTPException(status_code=404, detail="Topic not found")
     keywords = info.get("keywords", [])[:5]
     if _is_sensitive(label, keywords):
         raise HTTPException(status_code=404, detail="Topic not found")
 
-    # Find breadcrumb
     root_cat = None
     sub_cat = None
-    for root_name, subcats in HIERARCHY.items():
+    for root_name, subcats in user.hierarchy.items():
         for sub_name, labels in subcats.items():
             if label in labels:
                 root_cat = root_name

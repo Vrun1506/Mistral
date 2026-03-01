@@ -1,67 +1,29 @@
+import asyncio
 import json
 from collections.abc import AsyncGenerator
-from typing import Annotated
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
-from supabase import create_client
+from pydantic import BaseModel
 
-from config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
+from auth import get_current_user_id
 from services.claude_fetcher.master import ClaudeFetcher
+from services.pipeline.pipeline import run_pipeline_async
 from store import create_user_object_with_convos
+
+
+class FetchRequest(BaseModel):
+    session_key: str
+    last_active_org: str
 
 router = APIRouter()
 
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-
-# Takes in the cookies.json file
 @router.post("/get-cookies")
-async def get_cookies(request: Request, file: Annotated[UploadFile, File()]) -> StreamingResponse:
-    ## USER VALIDATION
-    # @supabase/ssr stores session in sb-<ref>-auth-token cookie (may be chunked: .0, .1, …)
-    cookie_name = "sb-koiaoajdcnxsarfpsfau-auth-token"
-    raw = request.cookies.get(cookie_name, "")
-    if not raw:
-        # Reassemble chunked cookies
-        chunks: list[str] = []
-        i = 0
-        while True:
-            chunk = request.cookies.get(f"{cookie_name}.{i}", "")
-            if not chunk:
-                break
-            chunks.append(chunk)
-            i += 1
-        raw = "".join(chunks)
-
-    if not raw:
-        raise HTTPException(status_code=401, detail="Missing auth cookie")
-
-    try:
-        import base64
-        if raw.startswith("base64-"):
-            raw = base64.b64decode(raw[len("base64-"):] + "==").decode()
-        session = json.loads(raw)
-        access_token: str = session["access_token"]
-    except (json.JSONDecodeError, KeyError) as exc:
-        raise HTTPException(status_code=401, detail="Malformed auth cookie") from exc
-
-    user_response = supabase.auth.get_user(access_token)
-    if not user_response or not user_response.user:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user_id: str = user_response.user.id
-    ## END USER VALIDATION
-
-    # Load file in
-    try:
-        contents = await file.read()
-        cookies = json.loads(contents)
-    finally:
-        await file.close()
+async def get_cookies(body: FetchRequest, user_id: str = Depends(get_current_user_id)) -> StreamingResponse:
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        fetcher = ClaudeFetcher(cookies)
+        fetcher = ClaudeFetcher(session_key=body.session_key, org_id=body.last_active_org)
         count = await fetcher.get_all_conversations()
         yield f"data: {json.dumps({'type': 'info', 'message': f'Found {count} chats'})}\n\n"
 
@@ -77,18 +39,48 @@ async def get_cookies(request: Request, file: Annotated[UploadFile, File()]) -> 
             else:
                 yield f"data: {json.dumps({'type': 'error', 'message': chunk['message']})}\n\n"
 
-        # Debugging temporarily printing out the object and what it looks like in memory
-        summary = {
-            "user_id": user_id,
-            "total_conversations": len(user.conversations),
-            "conversations": [
-                {"uuid": c.uuid, "name": c.name, "message_count": len(c.messages)} for c in user.conversations.values()
-            ],
-        }
-        print(json.dumps(summary, indent=2))
+        await fetcher.close()
 
         done_msg = f"All conversations downloaded and stored ({len(user.conversations)} total)"
         yield f"data: {json.dumps({'type': 'info', 'message': done_msg})}\n\n"
-        await fetcher.close()
+
+        # --- Run pipeline on the stored conversations ---
+        # Convert to match pipeline input from the object we have in storage 
+        conversations = user.as_pipeline_input()
+        if not conversations:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'No conversations to process'})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'type': 'info', 'message': 'Starting pipeline...'})}\n\n"
+
+        progress_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def on_progress(phase, message, progress, **_kwargs):
+            event = {"type": "pipeline", "phase": str(phase), "message": message, "progress": progress}
+            progress_queue.put_nowait(json.dumps(event))
+
+        async def _run():
+            try:
+                topic_groups, hierarchy = await run_pipeline_async(
+                    conversations=conversations,
+                    on_progress=on_progress,
+                )
+                user.set_pipeline_results(topic_groups, hierarchy)
+            except Exception as e:
+                progress_queue.put_nowait(json.dumps({"type": "error", "message": f"Pipeline error: {e}"}))
+            finally:
+                progress_queue.put_nowait(None)
+
+        task = asyncio.create_task(_run())
+
+        while True:
+            event_data = await progress_queue.get()
+            if event_data is None:
+                break
+            yield f"data: {event_data}\n\n"
+
+        await task
+
+        yield f"data: {json.dumps({'type': 'info', 'message': f'Pipeline complete — {len(user.topic_groups or {})} topics, hierarchy ready'})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

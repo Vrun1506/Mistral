@@ -4,37 +4,26 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
-from services.pipeline.events import get_run
+from auth import get_current_user_id
+from store import get_user
 
 router = APIRouter(tags=["graph"])
 
 
 @router.get("/api/graph-data")
-async def graph_data(run_id: str | None = None) -> JSONResponse:
-    """Return topic hierarchy as flat nodes/links for 3d-force-graph.
+async def graph_data(user_id: str = Depends(get_current_user_id)) -> JSONResponse:
+    """Return topic hierarchy as flat nodes/links for 3d-force-graph."""
+    from main import _is_sensitive
 
-    If run_id is provided, returns per-run data.
-    Otherwise falls back to global data (legacy dev UI).
-    Sensitive topics are filtered in both cases.
-    """
-    from main import HIERARCHY, TOPIC_GROUPS, _is_sensitive
+    user = get_user(user_id)
+    if not user.topic_groups or not user.hierarchy:
+        return JSONResponse({"nodes": [], "links": []})
 
-    topic_groups: dict[str, Any]
-    hierarchy: dict[str, Any]
-
-    if run_id:
-        run = get_run(run_id)
-        if run and run.topic_groups and run.hierarchy:
-            topic_groups = run.topic_groups
-            hierarchy = run.hierarchy
-        else:
-            return JSONResponse({"nodes": [], "links": []})
-    else:
-        topic_groups = TOPIC_GROUPS
-        hierarchy = HIERARCHY
+    topic_groups = user.topic_groups
+    hierarchy = user.hierarchy
 
     nodes: list[dict[str, Any]] = []
     links: list[dict[str, str]] = []
