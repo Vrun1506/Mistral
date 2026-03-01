@@ -11,7 +11,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Light/frequently changing deps
 COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt && \
+    pip install --no-deps bertopic
 
 COPY . .
 

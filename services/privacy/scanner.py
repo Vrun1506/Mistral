@@ -1,15 +1,18 @@
-"""Privacy pre-scan: GLiNER-PII local entity detection.
+"""Privacy pre-scan: remote GLiNER-PII entity detection.
 
-Runs *before* any cloud embedding/LLM calls so conversations containing
-personal information can be excluded from processing entirely.
+Calls an external GLiNER-PII inference server over HTTP.  If the server
+is unreachable (or GLINER_SERVER_URL is not set), scanning is skipped
+gracefully so the pipeline can continue without PII filtering.
 """
 
 from __future__ import annotations
 
-import asyncio
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
+
+import httpx
 
 from models.schemas import PipelinePhase, PrivacyCategory, ScanResult
 
@@ -44,57 +47,35 @@ PII_FRIENDLY_NAMES: dict[str, str] = {
     "PASSWORD": "Passwords",
 }
 
+GLINER_SERVER_URL: str = os.getenv("GLINER_SERVER_URL", "")
+
 # ---------------------------------------------------------------------------
-# GLiNER model (lazy-loaded singleton)
+# Remote inference helpers
 # ---------------------------------------------------------------------------
 
-_gliner_model = None
-_gliner_lock = asyncio.Lock()
 
-_gliner_available: bool | None = None
-
-
-def _check_gliner_available() -> bool:
-    """Check if gliner + torch are installed."""
-    global _gliner_available
-    if _gliner_available is None:
-        try:
-            import gliner  # noqa: F401
-
-            _gliner_available = True
-        except ImportError:
-            _gliner_available = False
-            print("[privacy] gliner not installed — PII scanning disabled")
-    return _gliner_available
+async def _check_server_health(client: httpx.AsyncClient) -> bool:
+    """GET /health with a short timeout. Returns True if the server is up."""
+    try:
+        resp = await client.get(f"{GLINER_SERVER_URL}/health", timeout=3.0)
+        return bool(resp.status_code == 200)
+    except (httpx.RequestError, httpx.TimeoutException):
+        return False
 
 
-async def _get_gliner_model() -> Any:
-    """Lazily load the GLiNER-PII model (thread-safe, uses GPU if available)."""
-    global _gliner_model
-    if _gliner_model is not None:
-        return _gliner_model
-
-    if not _check_gliner_available():
-        return None
-
-    async with _gliner_lock:
-        if _gliner_model is not None:
-            return _gliner_model
-
-        def _load() -> Any:
-            import torch
-            from gliner import GLiNER
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"[privacy] Loading GLiNER-PII model (nvidia/gliner-PII) on {device}...")
-            model = GLiNER.from_pretrained("nvidia/gliner-PII")
-            if device == "cuda":
-                model = model.to(device)
-            print("[privacy] GLiNER-PII model loaded.")
-            return model
-
-        _gliner_model = await asyncio.to_thread(_load)
-        return _gliner_model
+async def _batch_predict_remote(
+    client: httpx.AsyncClient,
+    texts: dict[str, str],
+) -> dict[str, list[str]]:
+    """POST /predict with all sampled texts. Returns uuid -> list of labels."""
+    resp = await client.post(
+        f"{GLINER_SERVER_URL}/predict",
+        json={"texts": texts, "labels": PII_LABELS, "threshold": 0.3},
+        timeout=120.0,
+    )
+    resp.raise_for_status()
+    results: dict[str, list[str]] = resp.json()["results"]
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -119,53 +100,6 @@ def _sample_messages(messages: list[dict[str, str]], n: int = 3) -> str:
 
 
 # ---------------------------------------------------------------------------
-# GLiNER-PII scanning (local)
-# ---------------------------------------------------------------------------
-
-
-async def scan_conversation_pii(
-    text: str,
-    model: Any,
-    sem: asyncio.Semaphore,
-) -> set[str]:
-    """Run GLiNER-PII entity detection on text. Returns set of detected entity labels."""
-    async with sem:
-
-        def _predict() -> set[str]:
-            entities = model.predict_entities(text, PII_LABELS, threshold=0.3)
-            return {e["label"] for e in entities}
-
-        return await asyncio.to_thread(_predict)
-
-
-async def _batch_scan_pii(
-    texts: dict[str, str],  # uuid -> sampled text
-    model: Any,
-    sem: asyncio.Semaphore,
-    on_progress: Callable[..., None] | None = None,
-) -> dict[str, set[str]]:
-    """Scan all conversations for PII. Returns uuid -> set of PII labels."""
-    results: dict[str, set[str]] = {}
-    total = len(texts)
-    done = 0
-
-    async def _scan_one(uuid: str, text: str) -> None:
-        nonlocal done
-        labels = await scan_conversation_pii(text, model, sem)
-        results[uuid] = labels
-        done += 1
-        if on_progress and total > 0:
-            on_progress(
-                PipelinePhase.scanning,
-                f"PII scan: {done}/{total}",
-                done / total,
-            )
-
-    await asyncio.gather(*[_scan_one(uid, txt) for uid, txt in texts.items()])
-    return results
-
-
-# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -174,12 +108,19 @@ async def scan_conversations(
     conversations: list[dict[str, Any]],
     on_progress: Callable[..., None] | None = None,
 ) -> ScanResult:
-    """Run GLiNER-PII privacy scan.
+    """Run remote GLiNER-PII privacy scan.
 
     Returns a ScanResult with per-category conversation counts.
+    Skips gracefully if the inference server is unreachable or URL is not set.
     """
     if on_progress:
-        on_progress(PipelinePhase.scanning, "Loading privacy scanner...", 0.0)
+        on_progress(PipelinePhase.scanning, "Starting privacy scan...", 0.0)
+
+    # Early exit if no server URL configured
+    if not GLINER_SERVER_URL:
+        if on_progress:
+            on_progress(PipelinePhase.scanning, "PII scanning skipped (GLINER_SERVER_URL not set)", 1.0)
+        return ScanResult(total_conversations=len(conversations))
 
     # Sample messages for each conversation
     texts: dict[str, str] = {}
@@ -187,17 +128,27 @@ async def scan_conversations(
         uuid = conv["uuid"]
         texts[uuid] = _sample_messages(conv.get("messages", []))
 
-    # Run GLiNER-PII (local, GPU if available) — skipped if gliner not installed
-    gliner_model = await _get_gliner_model()
-    if gliner_model is not None:
+    # Check server health
+    async with httpx.AsyncClient() as client:
         if on_progress:
-            on_progress(PipelinePhase.scanning, "Running PII detection...", 0.05)
-        pii_sem = asyncio.Semaphore(10)
-        pii_results = await _batch_scan_pii(texts, gliner_model, pii_sem, on_progress)
-    else:
+            on_progress(PipelinePhase.scanning, "Checking PII inference server...", 0.05)
+
+        if not await _check_server_health(client):
+            if on_progress:
+                on_progress(PipelinePhase.scanning, "PII scanning skipped (inference server unreachable)", 1.0)
+            return ScanResult(total_conversations=len(conversations))
+
+        # Run remote prediction
         if on_progress:
-            on_progress(PipelinePhase.scanning, "PII scanning unavailable (gliner not installed)", 0.5)
-        pii_results = {}
+            on_progress(PipelinePhase.scanning, "Running PII detection...", 0.1)
+
+        try:
+            pii_results = await _batch_predict_remote(client, texts)
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            print(f"[privacy] Remote PII scan failed: {exc}")
+            if on_progress:
+                on_progress(PipelinePhase.scanning, "PII scanning failed (server error)", 1.0)
+            return ScanResult(total_conversations=len(conversations))
 
     # Build conversation_flags and categories from PII results
     conversation_flags: dict[str, list[str]] = defaultdict(list)
