@@ -28,7 +28,7 @@ def _find_related_labels(label: str, hierarchy: dict[str, Any]) -> list[str]:
     for _root, subcats in hierarchy.items():
         for _sub, labels in subcats.items():
             if label in labels:
-                return [l for l in labels if l != label]
+                return [lb for lb in labels if lb != label]
     return []
 
 
@@ -52,9 +52,7 @@ async def _generate_note_for_root(
                 sample_texts.append(" ".join(m["text"][:200] for m in messages[:3]))
             sample = " | ".join(sample_texts)[:600]
             topic_summaries.append(
-                f"### {label} (under {sub_name})\n"
-                f"Keywords: {', '.join(keywords)}\n"
-                f"Sample: {sample}\n"
+                f"### {label} (under {sub_name})\nKeywords: {', '.join(keywords)}\nSample: {sample}\n"
             )
 
     topics_block = "\n".join(topic_summaries[:30])
@@ -92,7 +90,7 @@ async def _generate_note_for_root(
                     max_tokens=2000,
                     temperature=0.3,
                 )
-                return resp.choices[0].message.content.strip()
+                return str(resp.choices[0].message.content or "").strip()
             except Exception as e:
                 if "429" in str(e) and attempt < 3:
                     await asyncio.sleep(2 * attempt)
@@ -114,9 +112,7 @@ async def generate_all_notes(user: UserData) -> None:
 
         for root_name, subcats in user.hierarchy.items():
             other_roots = [r for r in root_names if r != root_name]
-            task = asyncio.create_task(
-                _generate_note_for_root(root_name, subcats, user.topic_groups, other_roots)
-            )
+            task = asyncio.create_task(_generate_note_for_root(root_name, subcats, user.topic_groups, other_roots))
             tasks.append((root_name, task))
 
         for root_name, task in tasks:

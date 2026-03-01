@@ -17,9 +17,11 @@ from models.schemas import (
     GraphData,
     GraphLink,
     GraphNode,
+    PipelineContinueRequest,
     PipelinePhase,
     PipelineStartRequest,
     PipelineStartResponse,
+    ScanResult,
 )
 from services.pipeline.events import create_run, get_run, make_callback
 from store import get_user
@@ -47,12 +49,31 @@ def _get_sensitive_filter() -> Callable[[str, list[str]], bool]:
 # ---------------------------------------------------------------------------
 
 
+def _apply_category_filter(
+    conversations: list[dict[str, Any]],
+    scan_result: ScanResult,
+    excluded_categories: list[str],
+) -> list[dict[str, Any]]:
+    """Remove conversations whose flags intersect the excluded categories."""
+    if not excluded_categories:
+        return conversations
+
+    excluded_set = set(excluded_categories)
+    excluded_uuids: set[str] = set()
+    for uuid, flags in scan_result.conversation_flags.items():
+        if excluded_set.intersection(flags):
+            excluded_uuids.add(uuid)
+
+    return [c for c in conversations if c["uuid"] not in excluded_uuids]
+
+
 async def _run_pipeline_task(
     run_id: str, session_key: str, last_active_org: str, max_conversations: int = 2000, user_id: str | None = None
 ) -> None:
-    """Background task: fetch -> pipeline -> emit results via queue."""
+    """Background task: fetch -> scan -> (review) -> pipeline -> emit results via queue."""
     from services.claude_fetcher.fetch_all import async_fetch_conversations
     from services.pipeline.pipeline import run_pipeline_async
+    from services.privacy.scanner import scan_conversations
 
     run = get_run(run_id)
     if not run:
@@ -77,7 +98,53 @@ async def _run_pipeline_task(
 
         callback(PipelinePhase.fetching, f"Fetched {len(conversations)} conversations", 1.0)
 
-        # Phases 2-6: Pipeline
+        # Phase 2: Privacy scan
+        callback(PipelinePhase.scanning, "Starting privacy scan...", 0.0)
+        scan_result = await scan_conversations(conversations, on_progress=callback)
+        run.scan_result = scan_result
+
+        # If flagged conversations found, pause for user review
+        if scan_result.flagged_conversations > 0:
+            run.conversations = conversations
+            callback(
+                PipelinePhase.awaiting_review,
+                f"{scan_result.flagged_conversations} conversations flagged — review required",
+                1.0,
+                scan_result=scan_result,
+            )
+
+            # Wait for user to submit review, with keepalive to prevent SSE timeout
+            while not run.review_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        run.review_event.wait(),
+                        timeout=15.0,
+                    )
+                except TimeoutError:
+                    # Send keepalive to keep SSE connection alive
+                    callback(
+                        PipelinePhase.awaiting_review,
+                        "Waiting for review...",
+                        1.0,
+                    )
+
+            # Apply exclusions
+            conversations = _apply_category_filter(conversations, scan_result, run.excluded_categories)
+            run.conversations = None  # free memory
+
+            if not conversations:
+                callback(PipelinePhase.error, "All conversations were excluded. Nothing to process.", 0.0)
+                return
+
+            callback(
+                PipelinePhase.scanning,
+                f"Proceeding with {len(conversations)} conversations after filtering",
+                1.0,
+            )
+        else:
+            callback(PipelinePhase.scanning, "No sensitive content detected — skipping review", 1.0)
+
+        # Phases 3-7: Pipeline (embedding, segmenting, clustering, labeling, hierarchy)
         topic_groups, hierarchy = await run_pipeline_async(
             conversations=conversations,
             on_progress=callback,
@@ -126,9 +193,7 @@ async def _run_pipeline_task(
 _persist_lock = asyncio.Lock()
 
 
-async def _persist_results(
-    topic_groups: dict[str, Any], hierarchy: dict[str, Any], user_id: str | None = None
-) -> None:
+async def _persist_results(topic_groups: dict[str, Any], hierarchy: dict[str, Any], user_id: str | None = None) -> None:
     """Save results to disk, namespaced by user_id."""
     import os
 
@@ -249,3 +314,18 @@ async def stream_pipeline(run_id: str) -> EventSourceResponse:
             }
 
     return EventSourceResponse(event_generator())
+
+
+@router.post("/continue")
+async def continue_pipeline(req: PipelineContinueRequest) -> dict[str, str]:
+    """Resume a pipeline run after user reviews privacy scan results."""
+    run = get_run(req.run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Pipeline run not found")
+    if run.review_continued:
+        raise HTTPException(status_code=409, detail="Pipeline has already been continued")
+
+    run.review_continued = True
+    run.excluded_categories = req.excluded_categories
+    run.review_event.set()
+    return {"status": "continued"}

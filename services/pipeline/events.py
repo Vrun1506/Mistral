@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from models.schemas import GraphData, GraphNode, PipelinePhase, PipelineProgressEvent
+from models.schemas import GraphData, GraphNode, PipelinePhase, PipelineProgressEvent, ScanResult
 
 MAX_CONCURRENT_RUNS = 5
 RUN_TTL_SECONDS = 30 * 60  # 30 minutes
@@ -25,6 +25,12 @@ class PipelineRun:
     # Per-run results — NOT stored in globals
     topic_groups: dict[str, Any] | None = None
     hierarchy: dict[str, Any] | None = None
+    # Privacy scan fields
+    scan_result: ScanResult | None = None
+    conversations: list[dict[str, Any]] | None = None
+    review_event: asyncio.Event = field(default_factory=asyncio.Event)
+    excluded_categories: list[str] = field(default_factory=list)
+    review_continued: bool = False  # guard against double-continue
 
 
 # Active runs registry
@@ -64,6 +70,7 @@ def make_callback(
         *,
         node: GraphNode | None = None,
         graph_snapshot: GraphData | None = None,
+        scan_result: ScanResult | None = None,
     ) -> None:
         event = PipelineProgressEvent(
             phase=phase,
@@ -71,6 +78,7 @@ def make_callback(
             progress=progress,
             node=node,
             graph_snapshot=graph_snapshot,
+            scan_result=scan_result,
         )
         with contextlib.suppress(asyncio.QueueFull):
             run.queue.put_nowait(event)

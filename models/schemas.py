@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field
 
 class PipelinePhase(StrEnum):
     fetching = "fetching"
+    scanning = "scanning"
+    awaiting_review = "awaiting_review"
     embedding = "embedding"
     segmenting = "segmenting"
     clustering = "clustering"
@@ -21,6 +23,31 @@ class PipelinePhase(StrEnum):
     hierarchy = "hierarchy"
     done = "done"
     error = "error"
+
+
+# ---------------------------------------------------------------------------
+# Privacy scanning types
+# ---------------------------------------------------------------------------
+
+
+class PrivacyCategory(BaseModel):
+    id: str
+    name: str
+    source: str  # "gliner" | "nemoguard"
+    conversation_count: int = 0
+    conversation_uuids: list[str] = Field(default_factory=list)
+
+
+class ScanResult(BaseModel):
+    total_conversations: int = 0
+    flagged_conversations: int = 0
+    categories: list[PrivacyCategory] = Field(default_factory=list)
+    conversation_flags: dict[str, list[str]] = Field(default_factory=dict)  # uuid -> [category_ids]
+
+
+class PipelineContinueRequest(BaseModel):
+    run_id: str
+    excluded_categories: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +85,7 @@ class PipelineProgressEvent(BaseModel):
     progress: float = 0.0  # 0.0 - 1.0
     node: GraphNode | None = None
     graph_snapshot: GraphData | None = None
+    scan_result: ScanResult | None = None
 
 
 # ---------------------------------------------------------------------------
