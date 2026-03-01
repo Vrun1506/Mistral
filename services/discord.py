@@ -6,7 +6,7 @@ import asyncio
 
 import httpx
 
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1477640922983305281/OAXepDGfTC46zbzOKMVxJ-jTgSjmjuL5oY5SRKsHhkxJsk4LMaqecTe7OxhG2lBXFlHj"
+from config import DISCORD_WEBHOOK_URL
 
 _queue: asyncio.Queue[str] | None = None
 _worker_task: asyncio.Task | None = None
@@ -14,9 +14,11 @@ _worker_task: asyncio.Task | None = None
 
 async def _worker() -> None:
     """Drain the queue, sending one message per second."""
+    assert _queue is not None
+    queue = _queue
     async with httpx.AsyncClient() as client:
         while True:
-            msg = await _queue.get()
+            msg = await queue.get()
             try:
                 resp = await client.post(DISCORD_WEBHOOK_URL, json={"content": msg})
                 if resp.status_code == 429:
@@ -28,7 +30,7 @@ async def _worker() -> None:
             except Exception as e:
                 print(f"[discord] webhook failed: {e}")
             finally:
-                _queue.task_done()
+                queue.task_done()
             await asyncio.sleep(0.6)
 
 

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import traceback
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -115,14 +118,13 @@ async def generate_all_notes(user: UserData) -> None:
         for root_name, task in tasks:
             try:
                 md = await task
-            except Exception as e:
-                fire_discord(f"❌ Note failed [{root_name}]: `{e}`")
-                md = f"# {root_name}\n\nError generating note: {e}"
+            except Exception:
+                logger.exception("Note generation failed for %s", root_name)
+                fire_discord(f"❌ Note failed [{root_name}]")
+                md = f"# {root_name}\n\nError generating note. Please try again."
             user.notes[root_name] = md
 
-        fire_discord(
-            f"🎉 All notes complete: **{len(user.notes)}** notes generated"
-        )
+        fire_discord(f"🎉 All notes complete: **{len(user.notes)}** notes generated")
     except Exception:
         fire_discord(f"💀 generate_all_notes crashed: `{traceback.format_exc()[-500:]}`")
     finally:

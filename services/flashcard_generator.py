@@ -3,10 +3,12 @@
 Reuses the async client + semaphore from services/pipeline/pipeline.py
 so no extra API key or config is needed.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from services.pipeline.pipeline import CHAT_MODEL, _get_llm_sem, get_async_client
@@ -42,7 +44,7 @@ Aim for 8-15 high-quality cards. Mix card types. Prioritise understanding.
 
 async def generate_flashcards_for_topic(
     label: str,
-    segments: list[dict[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     """Generate flashcard dicts from pipeline topic segments."""
     context_parts = [f"TOPIC: {label}\n"]
@@ -98,13 +100,17 @@ async def generate_flashcards_from_text(
 ) -> list[dict[str, Any]]:
     """Generate flashcards from raw user-pasted text/notes."""
     if not content.strip():
-        segments = [{
-            "conversation_name": "notes",
-            "messages": [{"sender": "user", "text": f"Create flashcards about: {label}"}],
-        }]
+        segments = [
+            {
+                "conversation_name": "notes",
+                "messages": [{"sender": "user", "text": f"Create flashcards about: {label}"}],
+            }
+        ]
     else:
-        segments = [{
-            "conversation_name": "notes",
-            "messages": [{"sender": "user", "text": content}],
-        }]
+        segments = [
+            {
+                "conversation_name": "notes",
+                "messages": [{"sender": "user", "text": content}],
+            }
+        ]
     return await generate_flashcards_for_topic(label, segments)

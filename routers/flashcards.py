@@ -7,12 +7,16 @@ Endpoints:
     POST   /api/decks/from-topic/{label}    → generate deck from pipeline topic
     DELETE /api/decks/{deck_id}             → delete a deck
 """
+
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from auth import get_current_user_id
 from services.flashcard_generator import (
@@ -66,8 +70,9 @@ async def create_deck_from_text(
         raise HTTPException(status_code=400, detail="Label is required")
     try:
         cards = await generate_flashcards_from_text(req.label.strip(), req.content.strip())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Card generation failed: {e}")
+    except Exception:
+        logger.exception("Flashcard generation failed for label=%s", req.label)
+        raise HTTPException(status_code=500, detail="Card generation failed") from None
     deck_id = save_deck(user_id, req.label.strip(), cards)
     return {"deck_id": deck_id, "card_count": len(cards)}
 
@@ -83,14 +88,15 @@ async def create_deck_from_topic(
         raise HTTPException(status_code=404, detail="No pipeline results yet. Run the pipeline first.")
     topic_info = user.topic_groups.get(label)
     if not topic_info:
-        raise HTTPException(status_code=404, detail=f"Topic '{label}' not found")
+        raise HTTPException(status_code=404, detail="Topic not found")
     segments = topic_info.get("segments", [])
     if not segments:
         raise HTTPException(status_code=400, detail="Topic has no segments")
     try:
         cards = await generate_flashcards_for_topic(label, segments)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Card generation failed: {e}")
+    except Exception:
+        logger.exception("Flashcard generation failed for topic=%s", label)
+        raise HTTPException(status_code=500, detail="Card generation failed") from None
     deck_id = save_deck(user_id, label, cards)
     return {"deck_id": deck_id, "topic_label": label, "card_count": len(cards)}
 
