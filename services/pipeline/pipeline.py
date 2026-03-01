@@ -28,7 +28,7 @@ load_dotenv()
 
 NIM_BASE = "https://integrate.api.nvidia.com/v1"
 EMBED_MODEL = "baai/bge-m3"
-CHAT_MODEL = "mistralai/mistral-small-3.1-24b-instruct-2503"
+CHAT_MODEL = "mistralai/mistral-large-3-675b-instruct-2512"
 
 EMBED_BATCH_SIZE = 100
 DEPTH_THRESHOLD_FACTOR = 1.0  # boundary if depth > mean + factor * stdev
@@ -605,7 +605,7 @@ async def async_label_clusters(
     return result
 
 
-HIERARCHY_BATCH_SIZE = 30  # max topics per LLM call
+HIERARCHY_BATCH_SIZE = 100  # max topics per LLM call
 
 
 def _normalize_hierarchy(h: dict[str, Any]) -> None:
