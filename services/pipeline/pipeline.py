@@ -463,7 +463,7 @@ async def async_embed_texts(
     completed_batches = 0
     batch_lock = asyncio.Lock()
 
-    sem = asyncio.Semaphore(6)
+    sem = asyncio.Semaphore(10)
 
     async def embed_batch(idx: int, batch: list[str]) -> None:
         nonlocal completed_batches
