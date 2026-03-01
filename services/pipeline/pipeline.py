@@ -479,9 +479,14 @@ async def async_embed_texts(
                 completed_batches += 1
                 done = completed_batches
             if on_progress:
+                remaining = total - done
+                if remaining <= 2:
+                    msg = f"Finalizing embeddings ({remaining} remaining)..."
+                else:
+                    msg = f"Embedded batch {done}/{total}"
                 on_progress(
                     PipelinePhase.embedding,
-                    f"Embedded batch {done}/{total}",
+                    msg,
                     done / total,
                 )
 
