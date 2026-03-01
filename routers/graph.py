@@ -37,7 +37,7 @@ async def graph_data(user_id: str = Depends(get_current_user_id)) -> JSONRespons
             sub_seg_count = 0
             sub_has_topics = False
             for label in labels:
-                info = topic_groups.get(label, {})
+                info: dict[str, Any] = topic_groups.get(label, {})  # type: ignore[assignment]
                 keywords = info.get("keywords", [])[:5]
                 if _is_sensitive(label, keywords):
                     continue

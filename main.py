@@ -16,6 +16,7 @@ from fastapi.responses import RedirectResponse
 from routers.cookies import router as cookies_router
 from routers.graph import router as graph_router
 from routers.pipeline import router as pipeline_router
+from routers.skills import router as skills_router
 from routers.topics import router as topics_router
 
 app = FastAPI()
@@ -40,6 +41,7 @@ app.include_router(cookies_router)
 app.include_router(pipeline_router)
 app.include_router(graph_router)
 app.include_router(topics_router)
+app.include_router(skills_router)
 
 # ---------------------------------------------------------------------------
 # Topic data — loaded at startup

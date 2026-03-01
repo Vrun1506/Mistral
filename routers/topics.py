@@ -30,7 +30,7 @@ async def get_tree(user_id: str = Depends(get_current_user_id)) -> list[TreeRoot
             topics: list[TreeTopic] = []
             sub_seg = 0
             for label in labels:
-                info: dict[str, Any] = user.topic_groups.get(label, {})
+                info: dict[str, Any] = user.topic_groups.get(label, {})  # type: ignore[assignment]
                 keywords = info.get("keywords", [])[:5]
                 if _is_sensitive(label, keywords):
                     continue
@@ -75,7 +75,7 @@ async def get_topic(label: str, user_id: str = Depends(get_current_user_id)) -> 
     return TopicDetail(
         label=label,
         keywords=info["keywords"],
-        segments=info["segments"],
+        segments=info["segments"],  # type: ignore[arg-type]
         root_cat=root_cat,
         sub_cat=sub_cat,
     )

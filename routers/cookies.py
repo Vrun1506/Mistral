@@ -16,12 +16,12 @@ class FetchRequest(BaseModel):
     session_key: str
     last_active_org: str
 
+
 router = APIRouter()
 
 
 @router.post("/get-cookies")
 async def get_cookies(body: FetchRequest, user_id: str = Depends(get_current_user_id)) -> StreamingResponse:
-
     async def event_generator() -> AsyncGenerator[str, None]:
         fetcher = ClaudeFetcher(session_key=body.session_key, org_id=body.last_active_org)
         count = await fetcher.get_all_conversations()
@@ -45,7 +45,7 @@ async def get_cookies(body: FetchRequest, user_id: str = Depends(get_current_use
         yield f"data: {json.dumps({'type': 'info', 'message': done_msg})}\n\n"
 
         # --- Run pipeline on the stored conversations ---
-        # Convert to match pipeline input from the object we have in storage 
+        # Convert to match pipeline input from the object we have in storage
         conversations = user.as_pipeline_input()
         if not conversations:
             yield f"data: {json.dumps({'type': 'error', 'message': 'No conversations to process'})}\n\n"
@@ -55,14 +55,14 @@ async def get_cookies(body: FetchRequest, user_id: str = Depends(get_current_use
 
         progress_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-        def on_progress(phase, message, progress, **_kwargs):
+        def on_progress(phase: object, message: str, progress: float, **_kwargs: object) -> None:
             event = {"type": "pipeline", "phase": str(phase), "message": message, "progress": progress}
             progress_queue.put_nowait(json.dumps(event))
 
-        async def _run():
+        async def _run() -> None:
             try:
                 topic_groups, hierarchy = await run_pipeline_async(
-                    conversations=conversations,
+                    conversations=conversations,  # type: ignore[arg-type]
                     on_progress=on_progress,
                 )
                 user.set_pipeline_results(topic_groups, hierarchy)
@@ -81,6 +81,8 @@ async def get_cookies(body: FetchRequest, user_id: str = Depends(get_current_use
 
         await task
 
-        yield f"data: {json.dumps({'type': 'info', 'message': f'Pipeline complete — {len(user.topic_groups or {})} topics, hierarchy ready'})}\n\n"
+        n_topics = len(user.topic_groups or {})
+        msg = f"Pipeline complete — {n_topics} topics, hierarchy ready"
+        yield f"data: {json.dumps({'type': 'info', 'message': msg})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

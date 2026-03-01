@@ -34,7 +34,7 @@ async def get_current_user_id(request: Request) -> str:
 
     try:
         if raw.startswith("base64-"):
-            raw = base64.b64decode(raw[len("base64-"):] + "==").decode()
+            raw = base64.b64decode(raw[len("base64-") :] + "==").decode()
         session = json.loads(raw)
         access_token: str = session["access_token"]
     except (json.JSONDecodeError, KeyError) as exc:
@@ -44,4 +44,4 @@ async def get_current_user_id(request: Request) -> str:
     if not user_response or not user_response.user:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    return user_response.user.id
+    return str(user_response.user.id)
