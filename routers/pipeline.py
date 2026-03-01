@@ -9,9 +9,10 @@ import traceback
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
+from auth import get_current_user_id
 from models.schemas import (
     GraphData,
     GraphLink,
@@ -21,6 +22,7 @@ from models.schemas import (
     PipelineStartResponse,
 )
 from services.pipeline.events import create_run, get_run, make_callback
+from store import get_user
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
 
@@ -46,7 +48,7 @@ def _get_sensitive_filter() -> Callable[[str, list[str]], bool]:
 
 
 async def _run_pipeline_task(
-    run_id: str, session_key: str, last_active_org: str, max_conversations: int = 2000
+    run_id: str, session_key: str, last_active_org: str, max_conversations: int = 2000, user_id: str | None = None
 ) -> None:
     """Background task: fetch -> pipeline -> emit results via queue."""
     from services.claude_fetcher.fetch_all import async_fetch_conversations
@@ -85,6 +87,11 @@ async def _run_pipeline_task(
         # Store per-run results
         run.topic_groups = topic_groups
         run.hierarchy = hierarchy
+
+        # Store in user store so /api/topic/{label} and /api/tree work
+        if user_id:
+            user = get_user(user_id)
+            user.set_pipeline_results(topic_groups, hierarchy)
 
         # Build final graph snapshot for the frontend
         graph = _build_graph_data(topic_groups, hierarchy, sensitive_filter)
@@ -189,7 +196,9 @@ def _build_graph_data(
 
 
 @router.post("/start", response_model=PipelineStartResponse)
-async def start_pipeline(req: PipelineStartRequest) -> PipelineStartResponse:
+async def start_pipeline(
+    req: PipelineStartRequest, user_id: str = Depends(get_current_user_id)
+) -> PipelineStartResponse:
     """Start a new pipeline run. Returns run_id for SSE streaming."""
     try:
         run = create_run()
@@ -202,6 +211,7 @@ async def start_pipeline(req: PipelineStartRequest) -> PipelineStartResponse:
             session_key=req.session_key,
             last_active_org=req.last_active_org,
             max_conversations=req.max_conversations,
+            user_id=user_id,
         )
     )
     _background_tasks.add(task)

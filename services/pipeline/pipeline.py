@@ -139,7 +139,7 @@ def deep_tiling_segment(embeddings, window=3):
 # ---------------------------------------------------------------------------
 
 
-def build_segments(conversations, all_embeddings, provenance):
+def build_segments(conversations, all_embeddings, provenance, on_progress=None):
     """Run DeepTiling per conversation, return list of segment dicts."""
     segments = []
 
@@ -147,6 +147,9 @@ def build_segments(conversations, all_embeddings, provenance):
     conv_msgs: dict[int, list[tuple[int, Any]]] = {}  # conv_index → [(msg_index, embedding)]
     for idx, (ci, mi) in enumerate(provenance):
         conv_msgs.setdefault(ci, []).append((mi, all_embeddings[idx]))
+
+    total_convs = len([ci for ci in range(len(conversations)) if ci in conv_msgs])
+    processed = 0
 
     for ci, conv in enumerate(conversations):
         if ci not in conv_msgs:
@@ -170,6 +173,10 @@ def build_segments(conversations, all_embeddings, provenance):
                 }
             )
 
+        processed += 1
+        if on_progress and total_convs > 0:
+            on_progress(processed, total_convs, len(segments))
+
     return segments
 
 
@@ -178,7 +185,7 @@ def build_segments(conversations, all_embeddings, provenance):
 # ---------------------------------------------------------------------------
 
 
-def cluster_segments(segments):
+def cluster_segments(segments, on_progress=None):
     """Cluster segment embeddings with BERTopic.
     Returns (topics, topic_model, docs) where docs are the text representations."""
     from bertopic import BERTopic
@@ -198,8 +205,28 @@ def cluster_segments(segments):
     n_components = min(5, n - 1)
     min_cluster = max(2, min(3, n // 2))
 
+    # Wrap UMAP/HDBSCAN to emit progress when BERTopic calls them internally
+    class _ProgressUMAP(UMAP):  # type: ignore[misc]
+        def fit_transform(self, X, y=None):
+            if on_progress:
+                on_progress("reducing", f"Reducing {n} segments to {n_components}D with UMAP...", 0.0)
+            result = super().fit_transform(X, y)
+            if on_progress:
+                on_progress("reducing", "Dimension reduction complete", 0.33)
+            return result
+
+    class _ProgressHDBSCAN(HDBSCAN):  # type: ignore[misc]
+        def fit(self, X, y=None):
+            if on_progress:
+                on_progress("clustering", f"Finding clusters with HDBSCAN ({n} segments)...", 0.33)
+            result = super().fit(X, y)
+            n_clusters = len(set(self.labels_)) - (1 if -1 in self.labels_ else 0)
+            if on_progress:
+                on_progress("clustering", f"Found {n_clusters} clusters, extracting topics...", 0.66)
+            return result
+
     init = "random" if n < 10 else "spectral"
-    umap_model = UMAP(
+    umap_model = _ProgressUMAP(
         n_components=n_components,
         n_neighbors=n_neighbors,
         min_dist=0.0,
@@ -207,7 +234,9 @@ def cluster_segments(segments):
         init=init,
         random_state=42,
     )
-    hdbscan_model = HDBSCAN(min_cluster_size=min_cluster, min_samples=1, metric="euclidean", prediction_data=True)
+    hdbscan_model = _ProgressHDBSCAN(
+        min_cluster_size=min_cluster, min_samples=1, metric="euclidean", prediction_data=True
+    )
 
     topic_model = BERTopic(
         umap_model=umap_model,
@@ -217,6 +246,11 @@ def cluster_segments(segments):
     )
 
     topics, _ = topic_model.fit_transform(docs, embeddings=embeddings)
+
+    if on_progress:
+        n_topics = len(set(topics)) - (1 if -1 in topics else 0)
+        on_progress("done", f"{n_topics} topics discovered", 1.0)
+
     return topics, topic_model, docs
 
 
@@ -426,10 +460,13 @@ async def async_embed_texts(
     batches = [texts[i : i + EMBED_BATCH_SIZE] for i in range(0, len(texts), EMBED_BATCH_SIZE)]
     total = len(batches)
     results: list[list[list[float]]] = [[] for _ in range(total)]
+    completed_batches = 0
+    batch_lock = asyncio.Lock()
 
     sem = asyncio.Semaphore(6)
 
     async def embed_batch(idx: int, batch: list[str]) -> None:
+        nonlocal completed_batches
         async with sem:
             resp = await client.embeddings.create(
                 input=batch,
@@ -438,11 +475,14 @@ async def async_embed_texts(
                 extra_body={"input_type": "passage"},
             )
             results[idx] = [d.embedding for d in resp.data]
+            async with batch_lock:
+                completed_batches += 1
+                done = completed_batches
             if on_progress:
                 on_progress(
                     PipelinePhase.embedding,
-                    f"Embedded batch {idx + 1}/{total}",
-                    (idx + 1) / total,
+                    f"Embedded batch {done}/{total}",
+                    done / total,
                 )
 
     await asyncio.gather(*[embed_batch(i, b) for i, b in enumerate(batches)])
@@ -471,9 +511,11 @@ async def async_label_clusters(
 
     result: dict[str, Any] = {}
     label_lock = asyncio.Lock()
+    completed_count = 0
     sem = asyncio.Semaphore(5)
 
     async def label_one(idx: int, topic_id: int) -> None:
+        nonlocal completed_count
         async with sem:
             topic_words = topic_model.get_topic(topic_id)
             keywords = [w for w, _ in topic_words[:10]]
@@ -518,6 +560,8 @@ async def async_label_clusters(
                 if label in result:
                     label = f"{label} ({topic_id})"
                 result[label] = {"keywords": keywords, "segments": seg_list}
+                completed_count += 1
+                done = completed_count
 
             print(f"  Topic {topic_id} → {label} ({len(seg_list)} segments)")
 
@@ -526,8 +570,8 @@ async def async_label_clusters(
             if on_progress and not is_sensitive:
                 on_progress(
                     PipelinePhase.labeling,
-                    f"Topic {idx + 1}/{total}: {label}",
-                    (idx + 1) / total,
+                    f"Labeled {done}/{total}: {label}",
+                    done / total,
                     node=GraphNode(
                         id=f"topic::{label}",
                         name=label,
@@ -540,8 +584,8 @@ async def async_label_clusters(
             elif on_progress:
                 on_progress(
                     PipelinePhase.labeling,
-                    f"Topic {idx + 1}/{total} processed",
-                    (idx + 1) / total,
+                    f"Labeled {done}/{total}",
+                    done / total,
                 )
 
     await asyncio.gather(*[label_one(i, t) for i, t in enumerate(unique_topics)])
@@ -684,7 +728,16 @@ async def run_pipeline_async(
     # Step 2-3: Segment (CPU, offloaded to thread)
     if on_progress:
         on_progress(PipelinePhase.segmenting, "Segmenting conversations...", 0.0)
-    segments = await asyncio.to_thread(build_segments, conversations, all_embeddings, provenance)
+
+    def _seg_progress(processed: int, total: int, seg_count: int) -> None:
+        if on_progress:
+            on_progress(
+                PipelinePhase.segmenting,
+                f"Segmented {processed}/{total} conversations ({seg_count} segments)",
+                processed / total,
+            )
+
+    segments = await asyncio.to_thread(build_segments, conversations, all_embeddings, provenance, _seg_progress)
     print(f"  {len(segments)} segments created.")
     if on_progress:
         on_progress(PipelinePhase.segmenting, f"{len(segments)} segments created", 1.0)
@@ -692,7 +745,12 @@ async def run_pipeline_async(
     # Step 4: Cluster (CPU, offloaded to thread)
     if on_progress:
         on_progress(PipelinePhase.clustering, "Clustering segments...", 0.0)
-    topics, topic_model, docs = await asyncio.to_thread(cluster_segments, segments)
+
+    def _cluster_progress(step: str, message: str, progress: float) -> None:
+        if on_progress:
+            on_progress(PipelinePhase.clustering, message, progress)
+
+    topics, topic_model, docs = await asyncio.to_thread(cluster_segments, segments, _cluster_progress)
     n_topics = len(set(topics)) - (1 if -1 in topics else 0)
     print(f"  {n_topics} topics discovered.")
     if on_progress:
