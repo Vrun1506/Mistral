@@ -793,6 +793,10 @@ async def async_build_hierarchy(
         # Merge sub-hierarchies
         hierarchy = {}
         for sub_h in results:
+            # Normalize 2-level → 3-level before merging
+            for rn, val in list(sub_h.items()):
+                if isinstance(val, list):
+                    sub_h[rn] = {rn: val}
             for root_name, subcats in sub_h.items():
                 if root_name not in hierarchy:
                     hierarchy[root_name] = {}
