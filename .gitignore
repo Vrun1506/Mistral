@@ -12,6 +12,7 @@ build/
 
 # Credentials
 cookies.json
+*.pem
 
 # Generated pipeline data
 conversations.json
