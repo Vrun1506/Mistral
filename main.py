@@ -2,6 +2,7 @@ import json
 import os
 from typing import Any
 
+import config  # noqa: F401 — loads .env on import
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -16,6 +17,7 @@ app.include_router(cookies_router)
 # ---------------------------------------------------------------------------
 # Topic data — loaded at startup
 # ---------------------------------------------------------------------------
+
 
 TOPIC_GROUPS: dict[str, Any] = {}
 HIERARCHY: dict[str, Any] = {}

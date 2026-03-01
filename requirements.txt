@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
+python-multipart
 jinja2
 requests>=2.31.0
 mistralai>=1.0.0
@@ -16,3 +17,4 @@ umap-learn
 hdbscan
 curl_cffi
 python-dotenv
+supabase
