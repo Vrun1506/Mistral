@@ -2,3 +2,5 @@ numpy
 scikit-learn
 umap-learn
 hdbscan
+bertopic
+pandas
