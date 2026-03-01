@@ -33,6 +33,18 @@ CHAT_MODEL = "mistralai/mistral-large-3-675b-instruct-2512"
 EMBED_BATCH_SIZE = 100
 DEPTH_THRESHOLD_FACTOR = 1.0  # boundary if depth > mean + factor * stdev
 
+# Shared concurrency gate for all Mistral chat API calls (labels + hierarchy).
+# Keeps total in-flight requests under the NIM rate limit.
+LLM_CHAT_SEM: asyncio.Semaphore | None = None
+
+
+def _get_llm_sem() -> asyncio.Semaphore:
+    """Lazily create the shared LLM semaphore (must be called inside an event loop)."""
+    global LLM_CHAT_SEM
+    if LLM_CHAT_SEM is None:
+        LLM_CHAT_SEM = asyncio.Semaphore(10)
+    return LLM_CHAT_SEM
+
 
 def get_client() -> OpenAI:
     api_key = os.environ.get("NVIDIA_API_KEY")
@@ -515,7 +527,7 @@ async def async_label_clusters(
     result: dict[str, Any] = {}
     label_lock = asyncio.Lock()
     completed_count = 0
-    sem = asyncio.Semaphore(15)
+    sem = _get_llm_sem()
 
     async def label_one(idx: int, topic_id: int) -> None:
         nonlocal completed_count
@@ -855,11 +867,11 @@ async def async_build_hierarchy(
                 progress_label=f"batch {idx + 1}/{len(batches)}",
             )
 
-        # Run batches concurrently, gated by semaphore
-        hier_sem = asyncio.Semaphore(3)
+        # Run batches concurrently, gated by shared LLM semaphore
+        llm_sem = _get_llm_sem()
 
         async def _gated(idx: int, batch_labels: list[str]) -> dict[str, Any]:
-            async with hier_sem:
+            async with llm_sem:
                 return await _do_batch(idx, batch_labels)
 
         results = list(await asyncio.gather(*[_gated(i, b) for i, b in enumerate(batches)]))
@@ -935,7 +947,7 @@ async def _hierarchy_consumer(
     batch_idx = 0
     last_batch_at = 0  # how many labels had been accumulated when we last fired
 
-    hier_sem = asyncio.Semaphore(3)
+    sem = _get_llm_sem()
 
     def _make_entries(labels: list[str]) -> str:
         """Format labels + keywords into the bullet-list prompt format for _hierarchy_call."""
@@ -953,7 +965,7 @@ async def _hierarchy_consumer(
         """Create and return a task that runs a single hierarchy LLM call for a batch."""
 
         async def _run() -> dict:
-            async with hier_sem:
+            async with sem:
                 entries_text = _make_entries(batch_labels)
                 return await _hierarchy_call(
                     client,
