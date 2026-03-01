@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.env
+.ruff_cache/
+
+# Test credentials — never bake into image
+cookies.json
+headersupabase.json
+
+# Notion secrets
+services/notion/tokens.json
+services/notion/client.json
+
+# Generated pipeline data
+conversations.json
+topic_groups.json
+topic_hierarchy.json
