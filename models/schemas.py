@@ -68,6 +68,7 @@ class PipelineProgressEvent(BaseModel):
 class PipelineStartRequest(BaseModel):
     session_key: str
     last_active_org: str
+    max_conversations: int = 2000
 
 
 class PipelineStartResponse(BaseModel):

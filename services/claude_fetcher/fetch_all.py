@@ -148,6 +148,7 @@ async def async_fetch_conversations(
     session_key: str,
     last_active_org: str,
     on_progress: Callable[..., Any] | None = None,
+    max_conversations: int = 2000,
 ) -> list[dict[str, Any]]:
     """Fetch all conversations asynchronously using curl_cffi AsyncSession.
 
@@ -163,8 +164,9 @@ async def async_fetch_conversations(
         # 1. Fetch conversation list (sequential, paginated)
         all_convos: list[dict[str, Any]] = []
         cursor: str | None = None
-        while True:
-            params: dict[str, Any] = {"limit": 50, "starred": "false", "consistency": "eventual"}
+        while len(all_convos) < max_conversations:
+            batch_size = min(50, max_conversations - len(all_convos))
+            params: dict[str, Any] = {"limit": batch_size, "starred": "false", "consistency": "eventual"}
             if cursor:
                 params["cursor"] = cursor
 
@@ -176,15 +178,15 @@ async def async_fetch_conversations(
             if on_progress:
                 on_progress(
                     PipelinePhase.fetching,
-                    f"Listed {len(all_convos)} conversations",
-                    0.15,  # indeterminate — we don't know the total
+                    f"Listed {len(all_convos)} conversations (max {max_conversations})",
+                    0.15,
                 )
 
-            if len(data) < 50:
+            if len(data) < batch_size:
                 break
             cursor = data[-1].get("uuid")
 
-        convos = all_convos
+        convos = all_convos[:max_conversations]
         total = len(convos)
 
         # 2. Fetch full conversations concurrently with semaphore
