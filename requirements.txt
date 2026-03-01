@@ -5,6 +5,7 @@ python-multipart
 jinja2
 requests>=2.31.0
 mistralai>=1.0.0
+exa-py
 mcp>=1.0.0
 authlib>=1.3.0
 sse-starlette>=1.6.0
