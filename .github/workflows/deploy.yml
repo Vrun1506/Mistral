@@ -1,0 +1,36 @@
+name: Deploy to Production
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Deploy to server
+      uses: appleboy/ssh-action@v1.0.3
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        host: 4.251.193.23
+        username: azureuser
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        port: 22
+        envs: GITHUB_TOKEN
+        script: |
+          cd /home/azureuser/final_production/Mistral
+          
+          git fetch https://github-token:${GITHUB_TOKEN}@github.com/Vrun1506/Mistral.git main
+          git reset --hard FETCH_HEAD
+          
+          sudo docker stop mistral-backend || true
+          sudo docker rm mistral-backend || true
+          
+          sudo docker build -t mistral-backend .
+          sudo docker run -d --name mistral-backend --env-file .env -p 8000:8000 mistral-backend
+          
+          sudo docker image prune -f
