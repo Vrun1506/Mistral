@@ -101,10 +101,14 @@ async def _get_gliner_model() -> Any:
             return _gliner_model
 
         def _load() -> Any:
+            import torch
             from gliner import GLiNER
 
-            print("[privacy] Loading GLiNER-PII model (nvidia/gliner-PII)...")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[privacy] Loading GLiNER-PII model (nvidia/gliner-PII) on {device}...")
             model = GLiNER.from_pretrained("nvidia/gliner-PII")
+            if device == "cuda":
+                model = model.to(device)
             print("[privacy] GLiNER-PII model loaded.")
             return model
 
@@ -311,7 +315,7 @@ async def scan_conversations(
         uuid = conv["uuid"]
         texts[uuid] = _sample_messages(conv.get("messages", []))
 
-    # Run GLiNER-PII (local, CPU)
+    # Run GLiNER-PII (local, GPU if available)
     if on_progress:
         on_progress(PipelinePhase.scanning, "Running PII detection...", 0.05)
 
