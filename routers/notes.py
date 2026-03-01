@@ -29,11 +29,14 @@ NOTES_SYSTEM_PROMPT = (
     "- Keep it conversational and readable, like clean study notes\n"
     "- Use [[wiki-links]] when referencing other topic labels\n\n"
     "TOOL USAGE:\n"
-    "You have access to exa_search to find relevant links and sources.\n"
-    "After generating your initial notes, use exa_search to find supporting "
-    "links, references, or further reading. You can search multiple times "
-    "with different queries to gather comprehensive sources.\n"
-    "Append a ## Sources section at the end with the links you found."
+    "You have access to exa_search. Use it to find real information that ENRICHES "
+    "your notes — facts, explanations, context, definitions, or examples.\n"
+    "When you get search results, READ the snippets and weave the useful information "
+    "directly into your note paragraphs as if you already knew it. Integrate the "
+    "knowledge naturally into the text. Do NOT just list links at the end.\n"
+    "If a source is particularly useful, you can inline-link it like "
+    "[topic](url) within the paragraph where you used its information.\n"
+    "The final output must be a complete, self-contained note — not a link dump."
 )
 
 
