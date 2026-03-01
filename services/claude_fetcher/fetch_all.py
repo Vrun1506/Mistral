@@ -147,10 +147,9 @@ async def _async_api_get(
 async def async_fetch_conversations(
     session_key: str,
     last_active_org: str,
-    max_conversations: int = 50,
     on_progress: Callable[..., Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch conversations asynchronously using curl_cffi AsyncSession.
+    """Fetch all conversations asynchronously using curl_cffi AsyncSession.
 
     Parameters are passed directly — no cookies.json needed.
     Uses Semaphore(8) for concurrent full-conversation fetches.
@@ -164,9 +163,8 @@ async def async_fetch_conversations(
         # 1. Fetch conversation list (sequential, paginated)
         all_convos: list[dict[str, Any]] = []
         cursor: str | None = None
-        while len(all_convos) < max_conversations:
-            batch_size = min(50, max_conversations - len(all_convos))
-            params: dict[str, Any] = {"limit": batch_size, "starred": "false", "consistency": "eventual"}
+        while True:
+            params: dict[str, Any] = {"limit": 50, "starred": "false", "consistency": "eventual"}
             if cursor:
                 params["cursor"] = cursor
 
@@ -179,14 +177,14 @@ async def async_fetch_conversations(
                 on_progress(
                     PipelinePhase.fetching,
                     f"Listed {len(all_convos)} conversations",
-                    min(len(all_convos) / max_conversations * 0.3, 0.3),  # 0-30% for listing
+                    0.15,  # indeterminate — we don't know the total
                 )
 
-            if len(data) < batch_size:
+            if len(data) < 50:
                 break
             cursor = data[-1].get("uuid")
 
-        convos = all_convos[:max_conversations]
+        convos = all_convos
         total = len(convos)
 
         # 2. Fetch full conversations concurrently with semaphore

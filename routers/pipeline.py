@@ -45,7 +45,7 @@ def _get_sensitive_filter() -> Callable[[str, list[str]], bool]:
 # ---------------------------------------------------------------------------
 
 
-async def _run_pipeline_task(run_id: str, session_key: str, last_active_org: str, max_conversations: int) -> None:
+async def _run_pipeline_task(run_id: str, session_key: str, last_active_org: str) -> None:
     """Background task: fetch -> pipeline -> emit results via queue."""
     from services.claude_fetcher.fetch_all import async_fetch_conversations
     from services.pipeline.pipeline import run_pipeline_async
@@ -63,7 +63,6 @@ async def _run_pipeline_task(run_id: str, session_key: str, last_active_org: str
         conversations = await async_fetch_conversations(
             session_key=session_key,
             last_active_org=last_active_org,
-            max_conversations=max_conversations,
             on_progress=callback,
         )
 
@@ -199,7 +198,6 @@ async def start_pipeline(req: PipelineStartRequest) -> PipelineStartResponse:
             run_id=run.run_id,
             session_key=req.session_key,
             last_active_org=req.last_active_org,
-            max_conversations=req.max_conversations,
         )
     )
     _background_tasks.add(task)
