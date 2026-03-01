@@ -31,6 +31,8 @@ async def get_tree(user_id: str = Depends(get_current_user_id)) -> list[TreeRoot
             sub_seg = 0
             for label in labels:
                 info: dict[str, Any] = user.topic_groups.get(label, {})  # type: ignore[assignment]
+                if not info:
+                    continue
                 keywords = info.get("keywords", [])[:5]
                 if _is_sensitive(label, keywords):
                     continue

@@ -391,7 +391,14 @@ def build_hierarchy(client: OpenAI, topic_groups: dict[str, Any]) -> dict[str, A
         hierarchy[last_root].setdefault("Other", []).extend(sorted(missing))
 
     if extra:
-        print(f"  Warning: {len(extra)} extra labels in hierarchy: {extra}")
+        print(f"  Warning: {len(extra)} extra labels in hierarchy — removing: {extra}")
+        for root_name, subcats in list(hierarchy.items()):
+            for sub_name, labels in list(subcats.items()):
+                subcats[sub_name] = [lb for lb in labels if lb not in extra]
+                if not subcats[sub_name]:
+                    del subcats[sub_name]
+            if not subcats:
+                del hierarchy[root_name]
 
     return hierarchy
 
@@ -641,7 +648,14 @@ async def async_build_hierarchy(
         last_root = list(hierarchy.keys())[-1]
         hierarchy[last_root].setdefault("Other", []).extend(sorted(missing))
     if extra:
-        print(f"  Warning: {len(extra)} extra labels in hierarchy: {extra}")
+        print(f"  Warning: {len(extra)} extra labels in hierarchy — removing: {extra}")
+        for root_name, subcats in list(hierarchy.items()):
+            for sub_name, labels in list(subcats.items()):
+                subcats[sub_name] = [lb for lb in labels if lb not in extra]
+                if not subcats[sub_name]:
+                    del subcats[sub_name]
+            if not subcats:
+                del hierarchy[root_name]
 
     if on_progress:
         on_progress(PipelinePhase.hierarchy, "Hierarchy complete", 1.0)
