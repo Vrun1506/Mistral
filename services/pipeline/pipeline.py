@@ -499,8 +499,13 @@ async def async_label_clusters(
     docs: list[str],
     on_progress: Callable[..., Any] | None = None,
     sensitive_filter: Callable[[str, list[str]], bool] | None = None,
+    label_sink: asyncio.Queue[tuple[str, dict[str, list[str]]] | None] | None = None,
 ) -> dict[str, Any]:
-    """Label clusters concurrently via Mistral. Returns {label: {keywords, segments}}."""
+    """Label clusters concurrently via Mistral. Returns {label: {keywords, segments}}.
+
+    If label_sink is provided, pushes (label, {"keywords": keywords}) for each label
+    and a None sentinel when all labels are done.
+    """
     from models.schemas import GraphNode, PipelinePhase
 
     topic_info = topic_model.get_topic_info()
@@ -510,7 +515,7 @@ async def async_label_clusters(
     result: dict[str, Any] = {}
     label_lock = asyncio.Lock()
     completed_count = 0
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(15)
 
     async def label_one(idx: int, topic_id: int) -> None:
         nonlocal completed_count
@@ -532,17 +537,27 @@ async def async_label_clusters(
                 "Example segments:\n" + "\n---\n".join(rep_texts)
             )
 
-            try:
-                resp = await client.chat.completions.create(
-                    model=CHAT_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=30,
-                    temperature=0.3,
-                )
-                content = resp.choices[0].message.content
-                label = content.strip().strip('"').strip("'") if content else f"Topic {topic_id}"
-            except Exception as e:
-                print(f"  Warning: Mistral labeling failed for topic {topic_id}: {e}")
+            label: str | None = None
+            for attempt in range(1, 4):
+                try:
+                    resp = await client.chat.completions.create(
+                        model=CHAT_MODEL,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=30,
+                        temperature=0.3,
+                    )
+                    content = resp.choices[0].message.content
+                    label = content.strip().strip('"').strip("'") if content else f"Topic {topic_id}"
+                    break
+                except Exception as e:
+                    if "429" in str(e) and attempt < 3:
+                        print(f"  Rate limited labeling topic {topic_id}, retrying in {2 * attempt}s...")
+                        await asyncio.sleep(2 * attempt)
+                        continue
+                    print(f"  Warning: Mistral labeling failed for topic {topic_id}: {e}")
+                    label = f"Topic {topic_id}: {', '.join(keywords[:3])}"
+                    break
+            if label is None:
                 label = f"Topic {topic_id}: {', '.join(keywords[:3])}"
 
             seg_list = []
@@ -560,6 +575,10 @@ async def async_label_clusters(
                 result[label] = {"keywords": keywords, "segments": seg_list}
                 completed_count += 1
                 done = completed_count
+
+            # Push to hierarchy consumer if sink is available
+            if label_sink is not None:
+                await label_sink.put((label, {"keywords": keywords}))
 
             print(f"  Topic {topic_id} → {label} ({len(seg_list)} segments)")
 
@@ -586,21 +605,28 @@ async def async_label_clusters(
                     done / total,
                 )
 
-    await asyncio.gather(*[label_one(i, t) for i, t in enumerate(unique_topics)])
+    try:
+        await asyncio.gather(*[label_one(i, t) for i, t in enumerate(unique_topics)])
 
-    # Handle outliers
-    outlier_indices = [i for i, t in enumerate(topics) if t == -1]
-    if outlier_indices:
-        seg_list = []
-        for idx in outlier_indices:
-            seg_list.append(
-                {
-                    "conversation_name": segments[idx]["conversation_name"],
-                    "messages": segments[idx]["messages"],
-                }
-            )
-        result["Uncategorized"] = {"keywords": [], "segments": seg_list}
-        print(f"  Outliers → Uncategorized ({len(seg_list)} segments)")
+        # Handle outliers
+        outlier_indices = [i for i, t in enumerate(topics) if t == -1]
+        if outlier_indices:
+            seg_list = []
+            for idx in outlier_indices:
+                seg_list.append(
+                    {
+                        "conversation_name": segments[idx]["conversation_name"],
+                        "messages": segments[idx]["messages"],
+                    }
+                )
+            result["Uncategorized"] = {"keywords": [], "segments": seg_list}
+            print(f"  Outliers → Uncategorized ({len(seg_list)} segments)")
+            if label_sink is not None:
+                await label_sink.put(("Uncategorized", {"keywords": []}))
+    finally:
+        # Always push sentinel so hierarchy consumer doesn't hang
+        if label_sink is not None:
+            await label_sink.put(None)
 
     return result
 
@@ -829,10 +855,14 @@ async def async_build_hierarchy(
                 progress_label=f"batch {idx + 1}/{len(batches)}",
             )
 
-        # Run sequentially to avoid rate limits
-        results = []
-        for i, b in enumerate(batches):
-            results.append(await _do_batch(i, b))
+        # Run batches concurrently, gated by semaphore
+        hier_sem = asyncio.Semaphore(3)
+
+        async def _gated(idx: int, batch_labels: list[str]) -> dict[str, Any]:
+            async with hier_sem:
+                return await _do_batch(idx, batch_labels)
+
+        results = list(await asyncio.gather(*[_gated(i, b) for i, b in enumerate(batches)]))
 
         # Merge sub-hierarchies
         hierarchy = {}
@@ -885,6 +915,135 @@ async def async_build_hierarchy(
     return hierarchy
 
 
+async def _hierarchy_consumer(
+    client: AsyncOpenAI,
+    label_queue: asyncio.Queue[tuple[str, dict[str, list[str]]] | None],
+    on_progress: Callable | None = None,
+) -> dict:
+    """Consume labels from the queue and fire hierarchy batches as they fill up.
+
+    Reads (label, {"keywords": [...]}) items from the queue.  When accumulated
+    count crosses a HIERARCHY_BATCH_SIZE boundary, fires a hierarchy batch.
+    After the sentinel (None) is received, fires the final partial batch.
+    Returns the merged hierarchy dict.
+    """
+    from models.schemas import PipelinePhase
+
+    # Accumulate label→keywords as they arrive
+    accumulated: dict[str, dict[str, list[str]]] = {}
+    batch_tasks: list[asyncio.Task[dict]] = []
+    batch_idx = 0
+    last_batch_at = 0  # how many labels had been accumulated when we last fired
+
+    hier_sem = asyncio.Semaphore(3)
+
+    def _make_entries(labels: list[str]) -> str:
+        entries = []
+        for label in labels:
+            info = accumulated.get(label, {})
+            kws = info.get("keywords", [])[:6]
+            if kws:
+                entries.append(f'- "{label}" [keywords: {", ".join(kws)}]')
+            else:
+                entries.append(f'- "{label}"')
+        return "\n".join(entries)
+
+    def _fire_batch(batch_labels: list[str], idx: int, n_batches_est: str) -> asyncio.Task[dict]:
+        async def _run() -> dict:
+            async with hier_sem:
+                entries_text = _make_entries(batch_labels)
+                return await _hierarchy_call(
+                    client,
+                    entries_text,
+                    len(batch_labels),
+                    on_progress,
+                    progress_label=f"batch {idx + 1}/{n_batches_est}",
+                )
+
+        return asyncio.create_task(_run())
+
+    while True:
+        item = await label_queue.get()
+        if item is None:
+            # Sentinel — fire final partial batch if any
+            remaining_labels = list(accumulated.keys())[last_batch_at:]
+            if remaining_labels:
+                if on_progress:
+                    on_progress(
+                        PipelinePhase.hierarchy,
+                        f"Building hierarchy for final {len(remaining_labels)} topics...",
+                        0.0,
+                    )
+                batch_tasks.append(_fire_batch(remaining_labels, batch_idx, "final"))
+            break
+
+        label, info = item
+        accumulated[label] = info
+
+        # Check if we've crossed a batch boundary
+        total_so_far = len(accumulated)
+        if total_so_far - last_batch_at >= HIERARCHY_BATCH_SIZE:
+            batch_labels = list(accumulated.keys())[last_batch_at:total_so_far]
+            if on_progress:
+                on_progress(
+                    PipelinePhase.hierarchy,
+                    f"Building hierarchy for batch of {len(batch_labels)} topics (streaming)...",
+                    0.0,
+                )
+            batch_tasks.append(_fire_batch(batch_labels, batch_idx, "?"))
+            batch_idx += 1
+            last_batch_at = total_so_far
+
+    # Wait for all batch tasks
+    if not batch_tasks:
+        return {}
+
+    results = list(await asyncio.gather(*batch_tasks))
+
+    # Merge sub-hierarchies (same logic as async_build_hierarchy)
+    hierarchy: dict = {}
+    for sub_h in results:
+        _normalize_hierarchy(sub_h)
+        for root_name, subcats in sub_h.items():
+            if root_name not in hierarchy:
+                hierarchy[root_name] = {}
+            for sub_name, labels in subcats.items():
+                existing = hierarchy[root_name].get(sub_name, [])
+                hierarchy[root_name][sub_name] = existing + labels
+
+    _normalize_hierarchy(hierarchy)
+
+    # Validate labels
+    found: set[str] = set()
+    for _root, subcats in hierarchy.items():
+        for _subcat, labels in subcats.items():
+            for label in labels:
+                found.add(label)
+
+    expected = set(accumulated.keys())
+    missing = expected - found
+    extra = found - expected
+
+    if missing:
+        print(f"  Warning: {len(missing)} labels missing from hierarchy")
+        last_root = list(hierarchy.keys())[-1]
+        hierarchy[last_root].setdefault("Other", []).extend(sorted(missing))
+    if extra:
+        print(f"  Warning: {len(extra)} extra labels — removing")
+        for root_name, subcats in list(hierarchy.items()):
+            for sub_name, labels in list(subcats.items()):
+                subcats[sub_name] = [lb for lb in labels if lb not in extra]
+                if not subcats[sub_name]:
+                    del subcats[sub_name]
+            if not subcats:
+                del hierarchy[root_name]
+
+    if on_progress:
+        on_progress(PipelinePhase.hierarchy, "Hierarchy complete", 1.0)
+
+    return hierarchy
+
+
 async def run_pipeline_async(
     conversations: list[dict[str, Any]],
     on_progress: Callable[..., Any] | None = None,
@@ -895,12 +1054,79 @@ async def run_pipeline_async(
 
     client = get_async_client()
 
-    # Step 1: Embed (async, concurrent batches)
+    # Step 1: Embed (async, concurrent batches) — with per-conversation cache
+    from services.pipeline.embed_cache import get_cached_embeddings, save_embeddings
+
     if on_progress:
         on_progress(PipelinePhase.embedding, "Preparing messages...", 0.0)
     texts, provenance = prepare_message_texts(conversations)
     print(f"  {len(texts)} messages to embed.")
-    all_embeddings = await async_embed_texts(client, texts, on_progress)
+
+    # Group provenance indices by conversation index
+    conv_msg_indices: dict[int, list[int]] = {}
+    for flat_idx, (ci, _mi) in enumerate(provenance):
+        conv_msg_indices.setdefault(ci, []).append(flat_idx)
+
+    # Check cache per conversation
+    cached_embeddings: dict[int, np.ndarray] = {}  # conv_index → embeddings
+    uncached_flat_indices: list[int] = []  # flat indices needing embedding
+    for ci in range(len(conversations)):
+        if ci not in conv_msg_indices:
+            continue
+        cached = get_cached_embeddings(conversations[ci])
+        if cached is not None and cached.shape[0] == len(conv_msg_indices[ci]):
+            cached_embeddings[ci] = cached
+        else:
+            uncached_flat_indices.extend(conv_msg_indices[ci])
+
+    cached_msg_count = sum(e.shape[0] for e in cached_embeddings.values())
+    total_msgs = len(texts)
+    uncached_msg_count = len(uncached_flat_indices)
+
+    if uncached_msg_count == 0:
+        print(f"  All {total_msgs} messages cached, skipping embedding.")
+        if on_progress:
+            on_progress(PipelinePhase.embedding, f"All {total_msgs} messages cached", 1.0)
+        # Assemble from cache
+        all_embeddings = np.zeros((total_msgs, cached_embeddings[next(iter(cached_embeddings))].shape[1]))
+        for ci, emb in cached_embeddings.items():
+            for local_idx, flat_idx in enumerate(conv_msg_indices[ci]):
+                all_embeddings[flat_idx] = emb[local_idx]
+    else:
+        if cached_msg_count > 0:
+            print(f"  {cached_msg_count}/{total_msgs} messages cached, embedding {uncached_msg_count} new...")
+            if on_progress:
+                on_progress(
+                    PipelinePhase.embedding,
+                    f"{cached_msg_count}/{total_msgs} cached, embedding {uncached_msg_count} new...",
+                    0.0,
+                )
+        uncached_texts = [texts[i] for i in uncached_flat_indices]
+        fresh_embeddings = await async_embed_texts(client, uncached_texts, on_progress)
+
+        # Determine embedding dimension
+        embed_dim = fresh_embeddings.shape[1]
+        all_embeddings = np.zeros((total_msgs, embed_dim))
+
+        # Fill cached positions
+        for ci, emb in cached_embeddings.items():
+            for local_idx, flat_idx in enumerate(conv_msg_indices[ci]):
+                all_embeddings[flat_idx] = emb[local_idx]
+
+        # Fill uncached positions
+        for out_idx, flat_idx in enumerate(uncached_flat_indices):
+            all_embeddings[flat_idx] = fresh_embeddings[out_idx]
+
+        # Save newly computed embeddings per conversation
+        uncached_conv_indices = set()
+        for flat_idx in uncached_flat_indices:
+            ci, _ = provenance[flat_idx]
+            uncached_conv_indices.add(ci)
+        for ci in uncached_conv_indices:
+            flat_indices = conv_msg_indices[ci]
+            conv_embs = np.array([all_embeddings[fi] for fi in flat_indices])
+            save_embeddings(conversations[ci], conv_embs)
+
     print(f"  Embeddings shape: {all_embeddings.shape}")
 
     # Step 2-3: Segment (CPU, offloaded to thread)
@@ -932,18 +1158,48 @@ async def run_pipeline_async(
     n_topics = len(set(topics)) - (1 if -1 in topics else 0)
     print(f"  {n_topics} topics discovered.")
     if on_progress:
-        on_progress(PipelinePhase.clustering, f"{n_topics} topics discovered", 1.0)
+        # Compute cluster size distribution for richer feedback
+        from collections import Counter
 
-    # Step 5: Label (async, concurrent API calls)
+        topic_counts = Counter(t for t in topics if t != -1)
+        if topic_counts:
+            top_sizes = sorted(topic_counts.values(), reverse=True)[:5]
+            sizes_str = ", ".join(str(s) for s in top_sizes)
+            on_progress(
+                PipelinePhase.clustering,
+                f"Discovered {n_topics} topics (largest clusters: {sizes_str}). Starting labeling...",
+                1.0,
+            )
+        else:
+            on_progress(PipelinePhase.clustering, f"{n_topics} topics discovered", 1.0)
+
+    # Step 5+6: Label and build hierarchy concurrently (producer-consumer)
     if on_progress:
         on_progress(PipelinePhase.labeling, "Labeling topics...", 0.0)
-    topic_groups = await async_label_clusters(
-        client, topics, topic_model, segments, docs, on_progress, sensitive_filter
+
+    label_queue: asyncio.Queue[tuple[str, dict[str, list[str]]] | None] = asyncio.Queue()
+
+    # Start labeling (producer) as a task
+    label_task = asyncio.create_task(
+        async_label_clusters(
+            client,
+            topics,
+            topic_model,
+            segments,
+            docs,
+            on_progress,
+            sensitive_filter,
+            label_sink=label_queue,
+        )
     )
+
+    # Hierarchy consumer runs concurrently, processing batches as labels arrive
+    hierarchy = await _hierarchy_consumer(client, label_queue, on_progress)
+
+    # Await label task to get topic_groups and propagate any exceptions
+    topic_groups = await label_task
     print(f"  {len(topic_groups)} topic groups.")
 
-    # Step 6: Hierarchy (single async call)
-    hierarchy = await async_build_hierarchy(client, topic_groups, on_progress)
     n_roots = len(hierarchy)
     n_subs = sum(len(sc) for sc in hierarchy.values())
     print(f"  {n_roots} root categories, {n_subs} subcategories.")

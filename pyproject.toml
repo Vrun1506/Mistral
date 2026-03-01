@@ -24,6 +24,7 @@ known-first-party = ["routers", "services", "models"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
+disallow_any_generics = false
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

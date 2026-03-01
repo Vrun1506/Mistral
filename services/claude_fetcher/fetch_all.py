@@ -161,39 +161,17 @@ async def async_fetch_conversations(
     base = f"https://claude.ai/api/organizations/{last_active_org}/chat_conversations"
 
     async with AsyncSession(impersonate="chrome") as session:
-        # 1. Fetch conversation list (sequential, paginated)
-        all_convos: list[dict[str, Any]] = []
-        cursor: str | None = None
-        while len(all_convos) < max_conversations:
-            batch_size = min(50, max_conversations - len(all_convos))
-            params: dict[str, Any] = {"limit": batch_size, "starred": "false", "consistency": "eventual"}
-            if cursor:
-                params["cursor"] = cursor
-
-            data = await _async_api_get(session, base, params, cookie_dict)
-            if not isinstance(data, list) or len(data) == 0:
-                break
-
-            all_convos.extend(data)
-            if on_progress:
-                on_progress(
-                    PipelinePhase.fetching,
-                    f"Listed {len(all_convos)} conversations (max {max_conversations})",
-                    0.15,
-                )
-
-            if len(data) < batch_size:
-                break
-            cursor = data[-1].get("uuid")
-
-        convos = all_convos[:max_conversations]
-        total = len(convos)
-
-        # 2. Fetch full conversations concurrently with semaphore
+        # Prefetch: dispatch detail fetches as each list page arrives
         sem = asyncio.Semaphore(15)
-        results: list[dict[str, Any] | None] = [None] * total
+        results_dict: dict[str, dict[str, Any]] = {}
+        all_uuids_ordered: list[str] = []
+        detail_tasks: list[asyncio.Task[None]] = []
+        completed_count = 0
+        count_lock = asyncio.Lock()
+        total_estimate = 0  # updated as pages arrive
 
-        async def fetch_one(idx: int, conv: dict[str, Any]) -> None:
+        async def fetch_one(conv: dict[str, Any]) -> None:
+            nonlocal completed_count
             async with sem:
                 conv_uuid = conv["uuid"]
                 url = f"{base}/{conv_uuid}"
@@ -209,23 +187,58 @@ async def async_fetch_conversations(
                     messages = extract_messages(data.get("chat_messages", []))
 
                 if messages:
-                    results[idx] = {
+                    results_dict[conv_uuid] = {
                         "uuid": conv_uuid,
                         "name": conv.get("name", "(untitled)"),
                         "messages": messages,
                     }
 
-                if on_progress:
-                    done = sum(1 for r in results if r is not None)
+                async with count_lock:
+                    completed_count += 1
+                    done = completed_count
+
+                if on_progress and total_estimate > 0:
                     on_progress(
                         PipelinePhase.fetching,
-                        f"Fetched {done}/{total} conversations",
-                        0.3 + (done / total) * 0.7,  # 30-100% for fetching
+                        f"Fetched {done}/{total_estimate} conversations",
+                        0.3 + (done / total_estimate) * 0.7,
                     )
 
-        await asyncio.gather(*[fetch_one(i, c) for i, c in enumerate(convos)])
+        # 1. Paginated listing — dispatch detail fetches immediately per page
+        listed_count = 0
+        cursor: str | None = None
+        while listed_count < max_conversations:
+            batch_size = min(50, max_conversations - listed_count)
+            params: dict[str, Any] = {"limit": batch_size, "starred": "false", "consistency": "eventual"}
+            if cursor:
+                params["cursor"] = cursor
 
-    return [r for r in results if r is not None]
+            data = await _async_api_get(session, base, params, cookie_dict)
+            if not isinstance(data, list) or len(data) == 0:
+                break
+
+            for conv in data:
+                all_uuids_ordered.append(conv["uuid"])
+                detail_tasks.append(asyncio.create_task(fetch_one(conv)))
+            listed_count += len(data)
+            total_estimate = listed_count
+
+            if on_progress:
+                on_progress(
+                    PipelinePhase.fetching,
+                    f"Listed {listed_count} conversations, fetching details...",
+                    0.15,
+                )
+
+            if len(data) < batch_size:
+                break
+            cursor = data[-1].get("uuid")
+
+        # 2. Wait for all detail fetches to complete
+        if detail_tasks:
+            await asyncio.gather(*detail_tasks)
+
+    return [results_dict[uuid] for uuid in all_uuids_ordered if uuid in results_dict]
 
 
 def main():
