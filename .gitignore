@@ -10,10 +10,13 @@ build/
 
 # Credentials
 cookies.json
-services/notion/tokens.json
-services/notion/client.json
 
 # Generated pipeline data
 conversations.json
 topic_groups.json
 topic_hierarchy.json
+
+# Node (not needed)
+node_modules/
+package.json
+package-lock.json
