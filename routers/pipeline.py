@@ -103,7 +103,15 @@ async def _run_pipeline_task(
         )
 
         # Optionally persist to disk
-        await _persist_results(topic_groups, hierarchy)
+        await _persist_results(topic_groups, hierarchy, user_id)
+
+        # Fire-and-forget: generate notes in background
+        if user_id:
+            from routers.notes import generate_all_notes
+
+            notes_task = asyncio.create_task(generate_all_notes(user))
+            _background_tasks.add(notes_task)
+            notes_task.add_done_callback(_background_tasks.discard)
 
     except Exception as e:
         traceback.print_exc()
@@ -118,17 +126,20 @@ async def _run_pipeline_task(
 _persist_lock = asyncio.Lock()
 
 
-async def _persist_results(topic_groups: dict[str, Any], hierarchy: dict[str, Any]) -> None:
-    """Save results to disk (optional, for legacy dev UI)."""
+async def _persist_results(
+    topic_groups: dict[str, Any], hierarchy: dict[str, Any], user_id: str | None = None
+) -> None:
+    """Save results to disk, namespaced by user_id."""
     import os
 
     data_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    suffix = f"_{user_id}" if user_id else ""
 
     async with _persist_lock:
 
         def _write() -> None:
-            groups_path = os.path.join(data_dir, "topic_groups.json")
-            hierarchy_path = os.path.join(data_dir, "topic_hierarchy.json")
+            groups_path = os.path.join(data_dir, f"topic_groups{suffix}.json")
+            hierarchy_path = os.path.join(data_dir, f"topic_hierarchy{suffix}.json")
             with open(groups_path, "w") as f:
                 json.dump(topic_groups, f, indent=2, default=str)
             with open(hierarchy_path, "w") as f:

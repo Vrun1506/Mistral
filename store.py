@@ -52,6 +52,8 @@ class UserData:
     conversations: dict[str, ConversationData] = field(default_factory=dict)
     topic_groups: TopicGroups | None = None
     hierarchy: TopicHierarchy | None = None
+    notes: dict[str, str] = field(default_factory=dict)  # label → markdown
+    notes_generating: bool = False
 
     # --- conversation helpers ---
 
