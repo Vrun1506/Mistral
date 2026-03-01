@@ -67,13 +67,17 @@ class ClaudeFetcher:
         data: dict[str, int] = resp.json()
         return data["count"]
 
-    async def fetch_conversation_list(self, total: int) -> list[str]:
+    async def fetch_conversation_list(self, limit: int | None = None) -> list[str]:
+        """Fetch conversation UUIDs, capped at `limit` (defaults to count_all)."""
+        if limit is None:
+            limit = await self.get_all_conversations()
+
         BASE = f"https://claude.ai/api/organizations/{self.org_id}/chat_conversations"
         all_convos: list[dict[str, str]] = []
         cursor: str | None = None
 
-        while len(all_convos) < total:
-            batch_size = min(50, total - len(all_convos))
+        while len(all_convos) < limit:
+            batch_size = min(50, limit - len(all_convos))
             params: dict[str, str | int | bool] = {
                 "limit": batch_size,
                 "starred": "false",

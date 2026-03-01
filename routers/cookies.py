@@ -20,6 +20,17 @@ class FetchRequest(BaseModel):
 router = APIRouter()
 
 
+@router.post("/count-conversations")
+async def count_conversations(body: FetchRequest, user_id: str = Depends(get_current_user_id)) -> dict[str, int]:
+    """Return the visible conversation count (matches claude.ai web UI)."""
+    fetcher = ClaudeFetcher(session_key=body.session_key, org_id=body.last_active_org)
+    try:
+        count = await fetcher.get_all_conversations()
+        return {"count": count}
+    finally:
+        await fetcher.close()
+
+
 @router.post("/get-cookies")
 async def get_cookies(body: FetchRequest, user_id: str = Depends(get_current_user_id)) -> StreamingResponse:
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -27,7 +38,7 @@ async def get_cookies(body: FetchRequest, user_id: str = Depends(get_current_use
         count = await fetcher.get_all_conversations()
         yield f"data: {json.dumps({'type': 'info', 'message': f'Found {count} chats'})}\n\n"
 
-        uuids = await fetcher.fetch_conversation_list(total=count)
+        uuids = await fetcher.fetch_conversation_list(limit=count)
         yield f"data: {json.dumps({'type': 'info', 'message': f'Fetched all {len(uuids)} conversation IDs'})}\n\n"
 
         user = create_user_object_with_convos(user_id)
