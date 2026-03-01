@@ -90,11 +90,31 @@ _gliner_model = None
 _gliner_lock = asyncio.Lock()
 
 
+_gliner_available: bool | None = None
+
+
+def _check_gliner_available() -> bool:
+    """Check if gliner + torch are installed."""
+    global _gliner_available
+    if _gliner_available is None:
+        try:
+            import gliner  # noqa: F401
+
+            _gliner_available = True
+        except ImportError:
+            _gliner_available = False
+            print("[privacy] gliner not installed — PII scanning disabled")
+    return _gliner_available
+
+
 async def _get_gliner_model() -> Any:
-    """Lazily load the GLiNER-PII model (thread-safe, runs on CPU)."""
+    """Lazily load the GLiNER-PII model (thread-safe, uses GPU if available)."""
     global _gliner_model
     if _gliner_model is not None:
         return _gliner_model
+
+    if not _check_gliner_available():
+        return None
 
     async with _gliner_lock:
         if _gliner_model is not None:
@@ -315,13 +335,17 @@ async def scan_conversations(
         uuid = conv["uuid"]
         texts[uuid] = _sample_messages(conv.get("messages", []))
 
-    # Run GLiNER-PII (local, GPU if available)
-    if on_progress:
-        on_progress(PipelinePhase.scanning, "Running PII detection...", 0.05)
-
+    # Run GLiNER-PII (local, GPU if available) — skipped if gliner not installed
     gliner_model = await _get_gliner_model()
-    pii_sem = asyncio.Semaphore(10)
-    pii_results = await _batch_scan_pii(texts, gliner_model, pii_sem, on_progress)
+    if gliner_model is not None:
+        if on_progress:
+            on_progress(PipelinePhase.scanning, "Running PII detection...", 0.05)
+        pii_sem = asyncio.Semaphore(10)
+        pii_results = await _batch_scan_pii(texts, gliner_model, pii_sem, on_progress)
+    else:
+        if on_progress:
+            on_progress(PipelinePhase.scanning, "PII scanning unavailable (gliner not installed)", 0.5)
+        pii_results = {}
 
     # Run NemoGuard (NIM API)
     if on_progress:
