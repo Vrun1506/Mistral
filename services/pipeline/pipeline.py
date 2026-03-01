@@ -398,19 +398,12 @@ def build_hierarchy(client: OpenAI, topic_groups: dict[str, Any]) -> dict[str, A
 
     hierarchy = json.loads(raw)
 
-    # Normalize: if LLM returned 2-level (root → [labels]), wrap as 3-level
-    for root_name, value in list(hierarchy.items()):
-        if isinstance(value, list):
-            hierarchy[root_name] = {root_name: value}
+    _normalize_hierarchy(hierarchy)
 
     # Validate: every label appears exactly once
     found = set()
     for _root, subcats in hierarchy.items():
-        for subcat, labels in subcats.items():
-            if isinstance(labels, str):
-                # Single label not wrapped in a list
-                subcats[subcat] = [labels]
-                labels = [labels]
+        for _subcat, labels in subcats.items():
             for label in labels:
                 found.add(label)
 
@@ -615,6 +608,37 @@ async def async_label_clusters(
 HIERARCHY_BATCH_SIZE = 30  # max topics per LLM call
 
 
+def _normalize_hierarchy(h: dict[str, Any]) -> None:
+    """Normalize a hierarchy dict in-place to strict 3-level form.
+
+    Handles: root→[labels], root→{sub→"single"}, root→{sub→{nested→[...]}}.
+    After this, every value is {subcategory: [label, ...]}.
+    """
+    for root_name, value in list(h.items()):
+        # 2-level: root → [labels]
+        if isinstance(value, list):
+            h[root_name] = {root_name: value}
+            continue
+        if not isinstance(value, dict):
+            h[root_name] = {root_name: [str(value)]}
+            continue
+        # 3-level: root → {sub → labels} — normalize each sub's value
+        for sub_name, labels in list(value.items()):
+            if isinstance(labels, str):
+                value[sub_name] = [labels]
+            elif isinstance(labels, dict):
+                # 4-level: flatten nested subcategories into labels
+                flat: list[str] = []
+                for nested_labels in labels.values():
+                    if isinstance(nested_labels, list):
+                        flat.extend(nested_labels)
+                    elif isinstance(nested_labels, str):
+                        flat.append(nested_labels)
+                value[sub_name] = flat
+            elif not isinstance(labels, list):
+                value[sub_name] = [str(labels)]
+
+
 async def _hierarchy_call(
     client: AsyncOpenAI,
     entries_text: str,
@@ -813,16 +837,11 @@ async def async_build_hierarchy(
         # Merge sub-hierarchies
         hierarchy = {}
         for sub_h in results:
-            # Normalize 2-level → 3-level before merging
-            for rn, val in list(sub_h.items()):
-                if isinstance(val, list):
-                    sub_h[rn] = {rn: val}
+            _normalize_hierarchy(sub_h)
             for root_name, subcats in sub_h.items():
                 if root_name not in hierarchy:
                     hierarchy[root_name] = {}
                 for sub_name, labels in subcats.items():
-                    if isinstance(labels, str):
-                        labels = [labels]
                     existing = hierarchy[root_name].get(sub_name, [])
                     hierarchy[root_name][sub_name] = existing + labels
 
@@ -833,18 +852,12 @@ async def async_build_hierarchy(
                 0.8,
             )
 
-    # Normalize 2-level → 3-level
-    for root_name, value in list(hierarchy.items()):
-        if isinstance(value, list):
-            hierarchy[root_name] = {root_name: value}
+    _normalize_hierarchy(hierarchy)
 
     # Validate labels
     found: set[str] = set()
     for _root, subcats in hierarchy.items():
-        for subcat, labels in subcats.items():
-            if isinstance(labels, str):
-                subcats[subcat] = [labels]
-                labels = [labels]
+        for _subcat, labels in subcats.items():
             for label in labels:
                 found.add(label)
 
