@@ -10,28 +10,55 @@ Structure per user:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TypedDict
+
+
+class Message(TypedDict):
+    sender: str
+    text: str
+
+
+class SegmentInfo(TypedDict):
+    conversation_name: str
+    messages: list[Message]
+
+
+class TopicGroupEntry(TypedDict):
+    keywords: list[str]
+    segments: list[SegmentInfo]
+
+
+# topic_groups: {label → TopicGroupEntry}
+TopicGroups = dict[str, TopicGroupEntry]
+# hierarchy: {root_category → {subcategory → [topic_label, ...]}}
+TopicHierarchy = dict[str, dict[str, list[str]]]
+
+
+class ConversationRaw(TypedDict):
+    uuid: str
+    name: str
+    messages: list[Message]
 
 
 @dataclass
 class ConversationData:
     uuid: str
     name: str
-    messages: list[dict]  # [{sender, text}, ...]
+    messages: list[Message]
 
 
 @dataclass
 class UserData:
     conversations: dict[str, ConversationData] = field(default_factory=dict)
-    topic_groups: dict[str, Any] | None = None
-    hierarchy: dict[str, Any] | None = None
+    topic_groups: TopicGroups | None = None
+    hierarchy: TopicHierarchy | None = None
 
     # --- conversation helpers ---
 
-    def upsert_conversation(self, uuid: str, name: str, messages: list[dict]) -> None:
+    def upsert_conversation(self, uuid: str, name: str, messages: list[Message]) -> None:
         self.conversations[uuid] = ConversationData(uuid=uuid, name=name, messages=messages)
 
-    def upsert_conversations_bulk(self, convos: list[dict]) -> None:
+    def upsert_conversations_bulk(self, convos: list[ConversationRaw]) -> None:
         """Accept the raw list format from fetch_all / ClaudeFetcher."""
         for c in convos:
             self.upsert_conversation(c["uuid"], c.get("name", "(untitled)"), c.get("messages", []))
@@ -39,16 +66,13 @@ class UserData:
     def get_conversation(self, uuid: str) -> ConversationData | None:
         return self.conversations.get(uuid)
 
-    def as_pipeline_input(self) -> list[dict]:
+    def as_pipeline_input(self) -> list[ConversationRaw]:
         """Return conversations in the format pipeline.run_pipeline expects."""
-        return [
-            {"uuid": c.uuid, "name": c.name, "messages": c.messages}
-            for c in self.conversations.values()
-        ]
+        return [ConversationRaw(uuid=c.uuid, name=c.name, messages=c.messages) for c in self.conversations.values()]
 
     # --- pipeline result helpers ---
 
-    def set_pipeline_results(self, topic_groups: dict, hierarchy: dict) -> None:
+    def set_pipeline_results(self, topic_groups: TopicGroups, hierarchy: TopicHierarchy) -> None:
         self.topic_groups = topic_groups
         self.hierarchy = hierarchy
 

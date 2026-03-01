@@ -1,41 +1,56 @@
 """Fetch Claude.ai conversations with full messages → conversations.json"""
 
+from __future__ import annotations
+
+import asyncio
 import json
 import sys
 import time
+from collections.abc import Callable
+from typing import Any
 
-from curl_cffi import requests
+from curl_cffi import requests as sync_requests
+from curl_cffi.requests import AsyncSession
 
 MAX_CONVERSATIONS = 50
-
-# --- Load cookies ---
-try:
-    with open("cookies.json") as f:
-        cookies = json.load(f)
-except FileNotFoundError:
-    print("ERROR: cookies.json not found.")
-    sys.exit(1)
-
-ORG = cookies.get("lastActiveOrg")
-if not ORG:
-    print("ERROR: lastActiveOrg cookie missing")
-    sys.exit(1)
-
-BASE = f"https://claude.ai/api/organizations/{ORG}/chat_conversations"
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
     "origin": "https://claude.ai",
     "referer": "https://claude.ai/recents",
-    "user-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"),
+    "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
 }
+
+# --- Load cookies (sync module-level, used only by CLI main()) ---
+_cookies: dict[str, Any] | None = None
+_ORG: str | None = None
+_BASE: str | None = None
+
+
+def _ensure_cookies() -> tuple[dict[str, Any], str, str]:
+    global _cookies, _ORG, _BASE
+    if _cookies is not None and _ORG is not None and _BASE is not None:
+        return _cookies, _ORG, _BASE
+    try:
+        with open("cookies.json") as f:
+            _cookies = json.load(f)
+    except FileNotFoundError:
+        print("ERROR: cookies.json not found.")
+        sys.exit(1)
+    _ORG = _cookies.get("lastActiveOrg")
+    if not _ORG:
+        print("ERROR: lastActiveOrg cookie missing")
+        sys.exit(1)
+    _BASE = f"https://claude.ai/api/organizations/{_ORG}/chat_conversations"
+    return _cookies, _ORG, _BASE
 
 
 def api_get(url, params):
     """GET with retries on transient errors."""
+    cookies, _, _ = _ensure_cookies()
     for attempt in range(3):
         try:
-            resp = requests.get(url, headers=HEADERS, cookies=cookies, params=params, impersonate="chrome")
+            resp = sync_requests.get(url, headers=HEADERS, cookies=cookies, params=params, impersonate="chrome")
             if resp.status_code != 200:
                 print(f"  HTTP {resp.status_code} (attempt {attempt + 1}/3)")
                 time.sleep(2)
@@ -49,6 +64,7 @@ def api_get(url, params):
 
 def fetch_conversation_list(limit):
     """Fetch the most recent `limit` conversations."""
+    _, _, base = _ensure_cookies()
     all_convos: list[object] = []
     cursor = None
     while len(all_convos) < limit:
@@ -57,7 +73,7 @@ def fetch_conversation_list(limit):
         if cursor:
             params["cursor"] = cursor
 
-        data = api_get(BASE, params)
+        data = api_get(base, params)
         if not isinstance(data, list) or len(data) == 0:
             break
 
@@ -88,7 +104,8 @@ def extract_messages(chat_messages):
 
 def fetch_full_conversation(uuid):
     """Fetch full messages for a single conversation."""
-    url = f"{BASE}/{uuid}"
+    _, _, base = _ensure_cookies()
+    url = f"{base}/{uuid}"
     params = {
         "tree": "True",
         "rendering_mode": "messages",
@@ -99,6 +116,116 @@ def fetch_full_conversation(uuid):
     if not data or (isinstance(data, dict) and data.get("type") == "error"):
         return []
     return extract_messages(data.get("chat_messages", []))
+
+
+# ---------------------------------------------------------------------------
+# Async fetcher — used by the API pipeline endpoint
+# ---------------------------------------------------------------------------
+
+
+async def _async_api_get(
+    session: AsyncSession,
+    url: str,
+    params: dict[str, Any],
+    cookie_dict: dict[str, str],
+) -> Any:
+    """Async GET with retries."""
+    for attempt in range(3):
+        try:
+            resp = await session.get(url, headers=HEADERS, cookies=cookie_dict, params=params)
+            if resp.status_code != 200:
+                print(f"  HTTP {resp.status_code} (attempt {attempt + 1}/3)")
+                await asyncio.sleep(2)
+                continue
+            return resp.json()
+        except Exception as e:
+            print(f"  Network error (attempt {attempt + 1}/3): {e}")
+            await asyncio.sleep(2)
+    return None
+
+
+async def async_fetch_conversations(
+    session_key: str,
+    last_active_org: str,
+    max_conversations: int = 50,
+    on_progress: Callable[..., Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch conversations asynchronously using curl_cffi AsyncSession.
+
+    Parameters are passed directly — no cookies.json needed.
+    Uses Semaphore(8) for concurrent full-conversation fetches.
+    """
+    from models.schemas import PipelinePhase
+
+    cookie_dict = {"sessionKey": session_key, "lastActiveOrg": last_active_org}
+    base = f"https://claude.ai/api/organizations/{last_active_org}/chat_conversations"
+
+    async with AsyncSession(impersonate="chrome") as session:
+        # 1. Fetch conversation list (sequential, paginated)
+        all_convos: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while len(all_convos) < max_conversations:
+            batch_size = min(50, max_conversations - len(all_convos))
+            params: dict[str, Any] = {"limit": batch_size, "starred": "false", "consistency": "eventual"}
+            if cursor:
+                params["cursor"] = cursor
+
+            data = await _async_api_get(session, base, params, cookie_dict)
+            if not isinstance(data, list) or len(data) == 0:
+                break
+
+            all_convos.extend(data)
+            if on_progress:
+                on_progress(
+                    PipelinePhase.fetching,
+                    f"Listed {len(all_convos)} conversations",
+                    min(len(all_convos) / max_conversations * 0.3, 0.3),  # 0-30% for listing
+                )
+
+            if len(data) < batch_size:
+                break
+            cursor = data[-1].get("uuid")
+
+        convos = all_convos[:max_conversations]
+        total = len(convos)
+
+        # 2. Fetch full conversations concurrently with semaphore
+        sem = asyncio.Semaphore(8)
+        results: list[dict[str, Any] | None] = [None] * total
+
+        async def fetch_one(idx: int, conv: dict[str, Any]) -> None:
+            async with sem:
+                conv_uuid = conv["uuid"]
+                url = f"{base}/{conv_uuid}"
+                params = {
+                    "tree": "True",
+                    "rendering_mode": "messages",
+                    "render_all_tools": "true",
+                    "consistency": "eventual",
+                }
+                data = await _async_api_get(session, url, params, cookie_dict)
+                messages: list[dict[str, str]] = []
+                if data and not (isinstance(data, dict) and data.get("type") == "error"):
+                    messages = extract_messages(data.get("chat_messages", []))
+
+                if messages:
+                    results[idx] = {
+                        "uuid": conv_uuid,
+                        "name": conv.get("name", "(untitled)"),
+                        "messages": messages,
+                    }
+
+                if on_progress:
+                    done = sum(1 for r in results if r is not None)
+                    on_progress(
+                        PipelinePhase.fetching,
+                        f"Fetched {done}/{total} conversations",
+                        0.3 + (done / total) * 0.7,  # 30-100% for fetching
+                    )
+
+        await asyncio.gather(*[fetch_one(i, c) for i, c in enumerate(convos)])
+
+    return [r for r in results if r is not None]
 
 
 def main():

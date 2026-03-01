@@ -1,18 +1,45 @@
 import json
 import os
+import re
 from typing import Any
 
-import config  # noqa: F401 — loads .env on import
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from starlette.exceptions import HTTPException
+from dotenv import load_dotenv
+
+import config  # noqa: F401 — loads .env on import
+
+load_dotenv()
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 
 from routers.cookies import router as cookies_router
+from routers.graph import router as graph_router
+from routers.pipeline import router as pipeline_router
+from routers.topics import router as topics_router
 
 app = FastAPI()
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ["ALLOWED_ORIGINS"].split(","),
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
+# ---------------------------------------------------------------------------
+# Routers
+# ---------------------------------------------------------------------------
+
 app.include_router(cookies_router)
+app.include_router(pipeline_router)
+app.include_router(graph_router)
+app.include_router(topics_router)
 
 # ---------------------------------------------------------------------------
 # Topic data — loaded at startup
@@ -26,7 +53,7 @@ DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 GROUPS_PATH = os.path.join(DATA_DIR, "topic_groups.json")
 HIERARCHY_PATH = os.path.join(DATA_DIR, "topic_hierarchy.json")
 
-templates = Jinja2Templates(directory=os.path.join(DATA_DIR, "templates"))
+FRONTEND_URL = os.environ["FRONTEND_URL"]
 
 
 def _load_topic_data() -> None:
@@ -52,81 +79,62 @@ def _load_topic_data() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tree helpers
+# Sensitive-topic filter
+# ---------------------------------------------------------------------------
+
+SENSITIVE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        # Health & medical
+        r"\b(illness|disease|disorder|diagnosis|symptom|chronic|cancer|tumor|diabetes)\b",
+        r"\b(medication|prescription|therapy|therapist|psychiatr|psycholog)\b",
+        r"\b(surgery|hospital|clinic|medical|patient)\b",
+        # Mental health
+        r"\b(depress|anxiety|bipolar|adhd|autism|ptsd|ocd|schizophren)\b",
+        r"\b(mental\s*health|suicid|self[- ]?harm|eating\s*disorder|addiction)\b",
+        r"\b(trauma|panic\s*attack|insomnia|burnout)\b",
+        # Relationships & family
+        r"\b(divorce|breakup|break[- ]?up|infidelity|cheating|affair)\b",
+        r"\b(marriage\s*problem|relationship\s*(issue|problem|trouble))\b",
+        r"\b(domestic\s*(violence|abuse)|child\s*custody|alimony)\b",
+        r"\b(family\s*(conflict|issue|problem|trouble|drama))\b",
+        # Sexuality & gender
+        r"\b(sexual\s*(orientation|identity|preference|health))\b",
+        r"\b(gender\s*(identity|dysphoria|transition))\b",
+        r"\b(fertility|pregnan|abortion|miscarriage|contracepti)\b",
+        # Personal identity / sensitive demographics
+        r"\b(religion|religious\s*belief|political\s*affiliation)\b",
+        r"\b(criminal\s*record|arrest|conviction|incarcerat)\b",
+        r"\b(debt|bankruptcy|financial\s*(trouble|hardship|distress))\b",
+        # Substance use
+        r"\b(drug\s*(use|abuse|addict)|alcohol|substance\s*abuse|rehab)\b",
+    ]
+]
+
+
+def _is_sensitive(label: str, keywords: list[str]) -> bool:
+    """Return True if a topic label or any of its keywords match sensitive patterns."""
+    texts = [label, *keywords]
+    for text in texts:
+        for pattern in SENSITIVE_PATTERNS:
+            if pattern.search(text):
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Redirects — all UI lives in the frontend (localhost:3000)
 # ---------------------------------------------------------------------------
 
 
-def _build_tree() -> list[dict[str, Any]]:
-    """Build enriched tree with segment counts at every level."""
-    tree: list[dict[str, Any]] = []
-    for root_name, subcats in HIERARCHY.items():
-        root: dict[str, Any] = {"name": root_name, "subcategories": [], "segment_count": 0}
-        for sub_name, labels in subcats.items():
-            sub: dict[str, Any] = {"name": sub_name, "topics": [], "segment_count": 0}
-            for label in labels:
-                info = TOPIC_GROUPS.get(label, {})
-                count = len(info.get("segments", []))
-                sub["topics"].append(
-                    {
-                        "label": label,
-                        "keywords": info.get("keywords", [])[:5],
-                        "segment_count": count,
-                    }
-                )
-                sub["segment_count"] += count
-            root["subcategories"].append(sub)
-            root["segment_count"] += sub["segment_count"]
-        tree.append(root)
-    return tree
+@app.get("/")
+async def index() -> RedirectResponse:
+    return RedirectResponse(f"{FRONTEND_URL}/dashboard")
 
 
-def _lookup_breadcrumb(label: str) -> tuple[str | None, str | None]:
-    """Find the root category and subcategory for a given topic label."""
-    for root_name, subcats in HIERARCHY.items():
-        for sub_name, labels in subcats.items():
-            if label in labels:
-                return root_name, sub_name
-    return None, None
-
-
-# ---------------------------------------------------------------------------
-# Topic browsing endpoints
-# ---------------------------------------------------------------------------
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request) -> HTMLResponse:
-    """Home page: expandable topic tree."""
-    tree = _build_tree()
-    total_topics = sum(len(t) for sub in HIERARCHY.values() for t in sub.values())
-    return templates.TemplateResponse(
-        request,
-        "index.html",
-        {
-            "tree": tree,
-            "total_topics": total_topics,
-        },
-    )
-
-
-@app.get("/topic/{label}", response_class=HTMLResponse)
-async def topic_detail(request: Request, label: str) -> HTMLResponse:
-    """Show all segments in a topic group."""
-    info = TOPIC_GROUPS.get(label)
-    if not info:
-        raise HTTPException(status_code=404, detail="Topic not found")
-    root_cat, sub_cat = _lookup_breadcrumb(label)
-    return templates.TemplateResponse(
-        request,
-        "topic.html",
-        {
-            "label": label,
-            "keywords": info["keywords"],
-            "segments": info["segments"],
-            "root_cat": root_cat,
-            "sub_cat": sub_cat,
-        },
-    )
+@app.get("/graph")
+async def graph_page() -> RedirectResponse:
+    return RedirectResponse(f"{FRONTEND_URL}/dashboard")
 
 
 # ---------------------------------------------------------------------------

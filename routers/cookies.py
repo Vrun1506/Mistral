@@ -1,10 +1,12 @@
 import json
+from collections.abc import AsyncGenerator
+from typing import Annotated
 
-from fastapi import APIRouter, Request, UploadFile, File, HTTPException
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from supabase import create_client
 
-from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+from config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from services.claude_fetcher.master import ClaudeFetcher
 from store import create_user_object_with_convos
 
@@ -15,14 +17,14 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # Takes in the cookies.json file
 @router.post("/get-cookies")
-async def get_cookies(request: Request, file: UploadFile = File(...)):
+async def get_cookies(request: Request, file: Annotated[UploadFile, File()]) -> StreamingResponse:
     ## USER VALIDATION
     # @supabase/ssr stores session in sb-<ref>-auth-token cookie (may be chunked: .0, .1, …)
     cookie_name = "sb-koiaoajdcnxsarfpsfau-auth-token"
     raw = request.cookies.get(cookie_name, "")
     if not raw:
         # Reassemble chunked cookies
-        chunks = []
+        chunks: list[str] = []
         i = 0
         while True:
             chunk = request.cookies.get(f"{cookie_name}.{i}", "")
@@ -37,15 +39,15 @@ async def get_cookies(request: Request, file: UploadFile = File(...)):
 
     try:
         session = json.loads(raw)
-        access_token = session["access_token"]
-    except (json.JSONDecodeError, KeyError):
-        raise HTTPException(status_code=401, detail="Malformed auth cookie")
+        access_token: str = session["access_token"]
+    except (json.JSONDecodeError, KeyError) as exc:
+        raise HTTPException(status_code=401, detail="Malformed auth cookie") from exc
 
     user_response = supabase.auth.get_user(access_token)
     if not user_response or not user_response.user:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    user_id = user_response.user.id
+    user_id: str = user_response.user.id
     ## END USER VALIDATION
 
     # Load file in
@@ -55,7 +57,7 @@ async def get_cookies(request: Request, file: UploadFile = File(...)):
     finally:
         await file.close()
 
-    async def event_generator():
+    async def event_generator() -> AsyncGenerator[str, None]:
         fetcher = ClaudeFetcher(cookies)
         count = await fetcher.get_all_conversations()
         yield f"data: {json.dumps({'type': 'info', 'message': f'Found {count} chats'})}\n\n"
@@ -71,19 +73,19 @@ async def get_cookies(request: Request, file: UploadFile = File(...)):
                 yield f"data: {json.dumps({'type': 'info', 'message': chunk['message']})}\n\n"
             else:
                 yield f"data: {json.dumps({'type': 'error', 'message': chunk['message']})}\n\n"
-        
-        # Debugging temporarily printing out the object and what it looks like in memory 
+
+        # Debugging temporarily printing out the object and what it looks like in memory
         summary = {
             "user_id": user_id,
             "total_conversations": len(user.conversations),
             "conversations": [
-                {"uuid": c.uuid, "name": c.name, "message_count": len(c.messages)}
-                for c in user.conversations.values()
+                {"uuid": c.uuid, "name": c.name, "message_count": len(c.messages)} for c in user.conversations.values()
             ],
         }
         print(json.dumps(summary, indent=2))
 
-        yield f"data: {json.dumps({'type': 'info', 'message': f'All conversations downloaded and stored ({len(user.conversations)} total)'})}\n\n"
+        done_msg = f"All conversations downloaded and stored ({len(user.conversations)} total)"
+        yield f"data: {json.dumps({'type': 'info', 'message': done_msg})}\n\n"
         await fetcher.close()
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

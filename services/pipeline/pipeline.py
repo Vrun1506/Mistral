@@ -9,14 +9,19 @@ Segmentation + Clustering pipeline.
 6. Build 3-level topic hierarchy via Mistral
 """
 
+from __future__ import annotations
+
+import asyncio
 import json
 import os
+import re as _re
 import sys
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 from sklearn.metrics.pairwise import cosine_similarity
 
 load_dotenv()
@@ -392,7 +397,312 @@ def build_hierarchy(client: OpenAI, topic_groups: dict[str, Any]) -> dict[str, A
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Async versions — used by the API pipeline endpoint
+# ---------------------------------------------------------------------------
+
+
+def get_async_client() -> AsyncOpenAI:
+    api_key = os.environ.get("NVIDIA_API_KEY")
+    if not api_key:
+        raise RuntimeError("NVIDIA_API_KEY not set")
+    return AsyncOpenAI(base_url=NIM_BASE, api_key=api_key)
+
+
+async def async_embed_texts(
+    client: AsyncOpenAI,
+    texts: list[str],
+    on_progress: Callable[..., Any] | None = None,
+) -> np.ndarray:
+    """Embed texts asynchronously with concurrent batches."""
+    from models.schemas import PipelinePhase
+
+    batches = [texts[i : i + EMBED_BATCH_SIZE] for i in range(0, len(texts), EMBED_BATCH_SIZE)]
+    total = len(batches)
+    results: list[list[list[float]]] = [[] for _ in range(total)]
+
+    sem = asyncio.Semaphore(3)
+
+    async def embed_batch(idx: int, batch: list[str]) -> None:
+        async with sem:
+            resp = await client.embeddings.create(
+                input=batch,
+                model=EMBED_MODEL,
+                encoding_format="float",
+                extra_body={"input_type": "passage"},
+            )
+            results[idx] = [d.embedding for d in resp.data]
+            if on_progress:
+                on_progress(
+                    PipelinePhase.embedding,
+                    f"Embedded batch {idx + 1}/{total}",
+                    (idx + 1) / total,
+                )
+
+    await asyncio.gather(*[embed_batch(i, b) for i, b in enumerate(batches)])
+
+    all_embeddings: list[list[float]] = []
+    for batch_result in results:
+        all_embeddings.extend(batch_result)
+    return np.array(all_embeddings)
+
+
+async def async_label_clusters(
+    client: AsyncOpenAI,
+    topics: list[int],
+    topic_model: Any,
+    segments: list[dict[str, Any]],
+    docs: list[str],
+    on_progress: Callable[..., Any] | None = None,
+    sensitive_filter: Callable[[str, list[str]], bool] | None = None,
+) -> dict[str, Any]:
+    """Label clusters concurrently via Mistral. Returns {label: {keywords, segments}}."""
+    from models.schemas import GraphNode, PipelinePhase
+
+    topic_info = topic_model.get_topic_info()
+    unique_topics = [t for t in topic_info["Topic"] if t != -1]
+    total = len(unique_topics)
+
+    result: dict[str, Any] = {}
+    label_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(5)
+
+    async def label_one(idx: int, topic_id: int) -> None:
+        async with sem:
+            topic_words = topic_model.get_topic(topic_id)
+            keywords = [w for w, _ in topic_words[:10]]
+
+            indices = [i for i, t in enumerate(topics) if t == topic_id]
+            rep_indices = indices[:3]
+            rep_texts = []
+            for r_idx in rep_indices:
+                text = " ".join(m["text"][:300] for m in segments[r_idx]["messages"])
+                rep_texts.append(text[:500])
+
+            prompt = (
+                "Given these keywords and example text segments from a conversation cluster, "
+                "generate a concise topic label (3-7 words). Reply with ONLY the label.\n\n"
+                f"Keywords: {', '.join(keywords)}\n\n"
+                "Example segments:\n" + "\n---\n".join(rep_texts)
+            )
+
+            try:
+                resp = await client.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=30,
+                    temperature=0.3,
+                )
+                content = resp.choices[0].message.content
+                label = content.strip().strip('"').strip("'") if content else f"Topic {topic_id}"
+            except Exception as e:
+                print(f"  Warning: Mistral labeling failed for topic {topic_id}: {e}")
+                label = f"Topic {topic_id}: {', '.join(keywords[:3])}"
+
+            seg_list = []
+            for s_idx in indices:
+                seg_list.append(
+                    {
+                        "conversation_name": segments[s_idx]["conversation_name"],
+                        "messages": segments[s_idx]["messages"],
+                    }
+                )
+
+            async with label_lock:
+                if label in result:
+                    label = f"{label} ({topic_id})"
+                result[label] = {"keywords": keywords, "segments": seg_list}
+
+            print(f"  Topic {topic_id} → {label} ({len(seg_list)} segments)")
+
+            # Emit progress node if not sensitive
+            is_sensitive = sensitive_filter(label, keywords) if sensitive_filter else False
+            if on_progress and not is_sensitive:
+                on_progress(
+                    PipelinePhase.labeling,
+                    f"Topic {idx + 1}/{total}: {label}",
+                    (idx + 1) / total,
+                    node=GraphNode(
+                        id=f"topic::{label}",
+                        name=label,
+                        level=2,
+                        segment_count=len(seg_list),
+                        type="topic",
+                        keywords=keywords[:5],
+                    ),
+                )
+            elif on_progress:
+                on_progress(
+                    PipelinePhase.labeling,
+                    f"Topic {idx + 1}/{total} processed",
+                    (idx + 1) / total,
+                )
+
+    await asyncio.gather(*[label_one(i, t) for i, t in enumerate(unique_topics)])
+
+    # Handle outliers
+    outlier_indices = [i for i, t in enumerate(topics) if t == -1]
+    if outlier_indices:
+        seg_list = []
+        for idx in outlier_indices:
+            seg_list.append(
+                {
+                    "conversation_name": segments[idx]["conversation_name"],
+                    "messages": segments[idx]["messages"],
+                }
+            )
+        result["Uncategorized"] = {"keywords": [], "segments": seg_list}
+        print(f"  Outliers → Uncategorized ({len(seg_list)} segments)")
+
+    return result
+
+
+async def async_build_hierarchy(
+    client: AsyncOpenAI,
+    topic_groups: dict[str, Any],
+    on_progress: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Build 3-level topic hierarchy asynchronously via Mistral."""
+    from models.schemas import PipelinePhase
+
+    if on_progress:
+        on_progress(PipelinePhase.hierarchy, "Building topic hierarchy...", 0.0)
+
+    entries = []
+    for label, info in topic_groups.items():
+        kws = info.get("keywords", [])[:6]
+        if kws:
+            entries.append(f'- "{label}" [keywords: {", ".join(kws)}]')
+        else:
+            entries.append(f'- "{label}"')
+    entries_text = "\n".join(entries)
+    n = len(entries)
+
+    prompt = (
+        "You are an expert librarian organizing technical topics into a knowledge taxonomy.\n\n"
+        f"Given these {n} topic labels with their associated keywords, organize them into a "
+        "hierarchical JSON tree: root category → subcategory → topic labels.\n\n"
+        "For each topic, first identify its true technical domain from the keywords, "
+        "then assign it to the most specific matching category. "
+        "Prioritize keyword evidence over surface-level label text when they conflict — "
+        "for example, a topic with keywords like [allocator, pointer, free] belongs in "
+        "systems programming, not multimedia, regardless of other words in the label.\n\n"
+        "Return ONLY valid JSON (no markdown fences) with this structure:\n"
+        "{\n"
+        '  "Root Category": {\n'
+        '    "Subcategory": ["Topic Label 1", "Topic Label 2"]\n'
+        "  }\n"
+        "}\n\n"
+        "Rules:\n"
+        "- Create as many root categories and subcategories as needed to organize the topics naturally\n"
+        "- Every topic label must appear EXACTLY once as a leaf\n"
+        "- Use the EXACT label text in quotes — do not rename or modify any label\n\n"
+        f"Topics:\n{entries_text}"
+    )
+
+    max_tokens = max(2000, n * 50)
+    resp = await client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": "You are an expert librarian and taxonomist. Respond with JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.3,
+    )
+    raw_content = resp.choices[0].message.content
+    raw = raw_content.strip() if raw_content else ""
+
+    raw = _re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = _re.sub(r"\s*```$", "", raw)
+
+    hierarchy: dict[str, Any] = json.loads(raw)
+
+    # Normalize 2-level → 3-level
+    for root_name, value in list(hierarchy.items()):
+        if isinstance(value, list):
+            hierarchy[root_name] = {root_name: value}
+
+    # Validate labels
+    found: set[str] = set()
+    for _root, subcats in hierarchy.items():
+        for subcat, labels in subcats.items():
+            if isinstance(labels, str):
+                subcats[subcat] = [labels]
+                labels = [labels]
+            for label in labels:
+                found.add(label)
+
+    expected = set(topic_groups.keys())
+    missing = expected - found
+    extra = found - expected
+
+    if missing:
+        print(f"  Warning: {len(missing)} labels missing from hierarchy: {missing}")
+        last_root = list(hierarchy.keys())[-1]
+        hierarchy[last_root].setdefault("Other", []).extend(sorted(missing))
+    if extra:
+        print(f"  Warning: {len(extra)} extra labels in hierarchy: {extra}")
+
+    if on_progress:
+        on_progress(PipelinePhase.hierarchy, "Hierarchy complete", 1.0)
+
+    return hierarchy
+
+
+async def run_pipeline_async(
+    conversations: list[dict[str, Any]],
+    on_progress: Callable[..., Any] | None = None,
+    sensitive_filter: Callable[[str, list[str]], bool] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the full pipeline asynchronously. Returns (topic_groups, hierarchy)."""
+    from models.schemas import PipelinePhase
+
+    client = get_async_client()
+
+    # Step 1: Embed (async, concurrent batches)
+    if on_progress:
+        on_progress(PipelinePhase.embedding, "Preparing messages...", 0.0)
+    texts, provenance = prepare_message_texts(conversations)
+    print(f"  {len(texts)} messages to embed.")
+    all_embeddings = await async_embed_texts(client, texts, on_progress)
+    print(f"  Embeddings shape: {all_embeddings.shape}")
+
+    # Step 2-3: Segment (CPU, offloaded to thread)
+    if on_progress:
+        on_progress(PipelinePhase.segmenting, "Segmenting conversations...", 0.0)
+    segments = await asyncio.to_thread(build_segments, conversations, all_embeddings, provenance)
+    print(f"  {len(segments)} segments created.")
+    if on_progress:
+        on_progress(PipelinePhase.segmenting, f"{len(segments)} segments created", 1.0)
+
+    # Step 4: Cluster (CPU, offloaded to thread)
+    if on_progress:
+        on_progress(PipelinePhase.clustering, "Clustering segments...", 0.0)
+    topics, topic_model, docs = await asyncio.to_thread(cluster_segments, segments)
+    n_topics = len(set(topics)) - (1 if -1 in topics else 0)
+    print(f"  {n_topics} topics discovered.")
+    if on_progress:
+        on_progress(PipelinePhase.clustering, f"{n_topics} topics discovered", 1.0)
+
+    # Step 5: Label (async, concurrent API calls)
+    if on_progress:
+        on_progress(PipelinePhase.labeling, "Labeling topics...", 0.0)
+    topic_groups = await async_label_clusters(
+        client, topics, topic_model, segments, docs, on_progress, sensitive_filter
+    )
+    print(f"  {len(topic_groups)} topic groups.")
+
+    # Step 6: Hierarchy (single async call)
+    hierarchy = await async_build_hierarchy(client, topic_groups, on_progress)
+    n_roots = len(hierarchy)
+    n_subs = sum(len(sc) for sc in hierarchy.values())
+    print(f"  {n_roots} root categories, {n_subs} subcategories.")
+
+    return topic_groups, hierarchy
+
+
+# ---------------------------------------------------------------------------
+# Main (sync CLI entry point)
 # ---------------------------------------------------------------------------
 
 
